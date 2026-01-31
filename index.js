@@ -91,17 +91,6 @@ app.post('/login', async (req, res) => {
 
 
 
-
-
-
-
-// (Eliminada la ruta duplicada POST /usuarios)
-
-
-
-
-
-
 // Listar todos los usuarios (GET /usuarios)
 app.get('/usuarios', async (req, res) => {
     try {
@@ -165,6 +154,85 @@ app.delete('/usuarios/:id', async (req, res) => {
 });
 
 
+// ==================== SERVICIOS CRUD ====================
+
+// Crear servicio (POST /servicios)
+app.post('/servicios', async (req, res) => {
+    try {
+        const { nombre, descripcion, precio, duracion } = req.body;
+        if (!nombre || !precio) {
+            return res.status(400).json({ error: 'Debes ingresar nombre y precio del servicio.' });
+        }
+        await pool.promise().query(
+            'INSERT INTO servicios (nombre, descripcion, precio, duracion) VALUES (?, ?, ?, ?)',
+            [nombre, descripcion || null, precio, duracion || null]
+        );
+        res.json({ mensaje: 'Servicio creado exitosamente' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al crear servicio.' });
+    }
+});
+
+// Listar todos los servicios (GET /servicios)
+app.get('/servicios', async (req, res) => {
+    try {
+        const [rows] = await pool.promise().query('SELECT * FROM servicios');
+        res.status(200).json({ servicios: rows });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar servicios.' });
+    }
+});
+
+// Ver servicio por id (GET /servicios/:id)
+app.get('/servicios/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const [rows] = await pool.promise().query('SELECT * FROM servicios WHERE id = ?', [id]);
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Servicio no encontrado.' });
+        }
+        res.status(200).json({ servicio: rows[0] });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar servicio.' });
+    }
+});
+
+// Actualizar servicio por id (PUT /servicios/:id)
+app.put('/servicios/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { nombre, descripcion, precio, duracion } = req.body;
+        await pool.promise().query(
+            'UPDATE servicios SET nombre = ?, descripcion = ?, precio = ?, duracion = ? WHERE id = ?',
+            [nombre, descripcion, precio, duracion, id]
+        );
+        res.json({ mensaje: 'Servicio actualizado correctamente' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al actualizar servicio.' });
+    }
+});
+
+// Eliminar servicio por id (DELETE /servicios/:id)
+app.delete('/servicios/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await pool.promise().query('DELETE FROM servicios WHERE id = ?', [id]);
+        res.json({ mensaje: 'Servicio eliminado correctamente' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al eliminar servicio.' });
+    }
+});
+
+
+
+
+
+
 
 
 
@@ -174,13 +242,20 @@ app.listen(port, () => {
     console.log('RUTAS DISPONIBLES 🚌:');
     console.log('POST   /register   -> Registrar usuario');
     console.log('POST   /login      -> Iniciar sesión');
-
-
     // Listar usuarios
+    console.log('USUARIOS⚙️');
     console.log('GET    /usuarios   -> Listar usuarios');
     console.log('PUT    /usuarios/:id   -> Actualizar usuario');
     console.log('DELETE /usuarios/:id   -> Eliminar usuario');
     console.log('GET    /usuarios/:id   -> Ver usuario por id');
+
+    // Listar servicios
+    console.log('SERVICIOS⚙️');
+    console.log('GET    /servicios   -> Listar servicios');
+    console.log('POST   /servicios   -> Crear servicio');
+    console.log('PUT    /servicios/:id   -> Actualizar servicio');
+    console.log('DELETE /servicios/:id   -> Eliminar servicio');
+    console.log('GET    /servicios/:id   -> Ver servicio por id');
 
 });
 
