@@ -17,6 +17,38 @@ const pool = mysql.createPool({
 
 });
 
+// ==================== MIDDLEWARES DE AUTORIZACIÓN ====================
+
+// Middleware para verificar roles
+const verificarRol = (...rolesPermitidos) => {
+    return async (req, res, next) => {
+        try {
+            const { id_usuario } = req.body; // o req.params según tu implementación
+            if (!id_usuario) {
+                return res.status(400).json({ error: 'ID de usuario requerido.' });
+            }
+
+            const [usuario] = await pool.promise().query(
+                'SELECT rol FROM usuarios WHERE id = ?',
+                [id_usuario]
+            );
+
+            if (usuario.length === 0) {
+                return res.status(404).json({ error: 'Usuario no encontrado.' });
+            }
+
+            if (!rolesPermitidos.includes(usuario[0].rol)) {
+                return res.status(403).json({ error: 'No tienes permisos para realizar esta acción.' });
+            }
+
+            next();
+        } catch (error) {
+            console.error(error);
+            res.status(500).json({ error: 'Error al verificar permisos.' });
+        }
+    };
+};
+
 // Registrar usuario (POST /register)
 app.post('/register', async (req, res) => {
     try {
@@ -37,6 +69,13 @@ app.post('/register', async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, 10);
         const rolFinal = rol || 'cliente';
         const telefonoFinal = telefono || null;
+
+        // Validar que el rol sea válido
+        const rolesValidos = ['admin', 'barbero', 'cliente'];
+        if (!rolesValidos.includes(rolFinal)) {
+            return res.status(400).json({ error: 'Rol no válido. Debe ser: admin, barbero o cliente.' });
+        }
+
         await pool.promise().query(
             'INSERT INTO usuarios (email, password, nombre, telefono, rol, activo, fecha_registro) VALUES (?, ?, ?, ?, ?, 1, NOW())',
             [email, hashedPassword, nombre, telefonoFinal, rolFinal]
