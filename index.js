@@ -229,12 +229,132 @@ app.delete('/servicios/:id', async (req, res) => {
 });
 
 
+// ==================== CITAS CRUD ====================
 
+// Crear cita (POST /citas)
+app.post('/citas', async (req, res) => {
+    try {
+        const { id_usuario, id_servicio, fecha_hora, notas } = req.body;
+        if (!id_usuario || !id_servicio || !fecha_hora) {
+            return res.status(400).json({ error: 'Debes ingresar usuario, servicio y fecha/hora.' });
+        }
+        // Validar que no exista otra cita en la misma fecha y hora
+        const [existing] = await pool.promise().query(
+            'SELECT id FROM citas WHERE fecha_hora = ? AND estado != ?',
+            [fecha_hora, 'cancelada']
+        );
+        if (existing.length > 0) {
+            return res.status(409).json({ error: 'Ya existe una cita para esta fecha y hora.' });
+        }
+        await pool.promise().query(
+            'INSERT INTO citas (id_usuario, id_servicio, fecha_hora, estado, notas) VALUES (?, ?, ?, ?, ?)',
+            [id_usuario, id_servicio, fecha_hora, 'pendiente', notas || null]
+        );
+        res.json({ mensaje: 'Cita creada exitosamente' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al crear cita.' });
+    }
+});
 
+// Listar todas las citas (GET /citas)
 
+app.get('/citas', async (req, res) => {
+    try {
+        const [rows] = await pool.promise().query(`
+            SELECT c.id, c.id_usuario, c.id_servicio, 
+                   DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') as fecha_hora, 
+                   c.estado, c.notas,
+                   u.nombre as nombre_usuario, u.email, u.telefono,
+                   s.nombre as nombre_servicio, s.precio, s.duracion
+            FROM citas c
+            INNER JOIN usuarios u ON c.id_usuario = u.id
+            INNER JOIN servicios s ON c.id_servicio = s.id
+            ORDER BY c.fecha_hora DESC
+        `);
+        res.status(200).json({ citas: rows });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar citas.' });
+    }
+});
 
+// Ver cita por id (GET /citas/:id)
+app.get('/citas/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const [rows] = await pool.promise().query(`
+            SELECT c.id, c.id_usuario, c.id_servicio,
+                   DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') as fecha_hora,
+                   c.estado, c.notas,
+                   u.nombre as nombre_usuario, u.email, u.telefono,
+                   s.nombre as nombre_servicio, s.precio, s.duracion
+            FROM citas c
+            INNER JOIN usuarios u ON c.id_usuario = u.id
+            INNER JOIN servicios s ON c.id_servicio = s.id
+            WHERE c.id = ?
+        `, [id]);
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Cita no encontrada.' });
+        }
+        res.status(200).json({ cita: rows[0] });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar cita.' });
+    }
+});
 
+// Actualizar cita por id (PUT /citas/:id)
+app.put('/citas/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { id_usuario, id_servicio, fecha_hora, estado, notas } = req.body;
+        // Validar que no exista otra cita en la misma fecha y hora (excluyendo la cita actual)
+        const [existing] = await pool.promise().query(
+            'SELECT id FROM citas WHERE fecha_hora = ? AND estado != ? AND id != ?',
+            [fecha_hora, 'cancelada', id]
+        );
+        if (existing.length > 0) {
+            return res.status(409).json({ error: 'Ya existe una cita para esta fecha y hora.' });
+        }
+        await pool.promise().query(
+            'UPDATE citas SET id_usuario = ?, id_servicio = ?, fecha_hora = ?, estado = ?, notas = ? WHERE id = ?',
+            [id_usuario, id_servicio, fecha_hora, estado, notas, id]
+        );
+        res.json({ mensaje: 'Cita actualizada correctamente' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al actualizar cita.' });
+    }
+});
 
+// Eliminar cita por id (DELETE /citas/:id)
+app.delete('/citas/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await pool.promise().query('DELETE FROM citas WHERE id = ?', [id]);
+        res.json({ mensaje: 'Cita eliminada correctamente' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al eliminar cita.' });
+    }
+});
+
+// Verificar disponibilidad de horario (GET /citas/disponibilidad/:fecha_hora)
+app.get('/citas/disponibilidad/:fecha_hora', async (req, res) => {
+    try {
+        const { fecha_hora } = req.params;
+        const [existing] = await pool.promise().query(
+            'SELECT id FROM citas WHERE fecha_hora = ? AND estado != ?',
+            [fecha_hora, 'cancelada']
+        );
+        const disponible = existing.length === 0;
+        res.status(200).json({ disponible, mensaje: disponible ? 'Horario disponible' : 'Horario ocupado' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al verificar disponibilidad.' });
+    }
+});
 
 
 app.listen(port, () => {
@@ -256,6 +376,15 @@ app.listen(port, () => {
     console.log('PUT    /servicios/:id   -> Actualizar servicio');
     console.log('DELETE /servicios/:id   -> Eliminar servicio');
     console.log('GET    /servicios/:id   -> Ver servicio por id');
+
+    // Listar citas
+    console.log('CITAS📅');
+    console.log('GET    /citas   -> Listar citas');
+    console.log('POST   /citas   -> Crear cita (valida disponibilidad)');
+    console.log('PUT    /citas/:id   -> Actualizar cita (valida disponibilidad)');
+    console.log('DELETE /citas/:id   -> Eliminar cita');
+    console.log('GET    /citas/:id   -> Ver cita por id');
+    console.log('GET    /citas/disponibilidad/:fecha_hora   -> Verificar disponibilidad');
 
 });
 
