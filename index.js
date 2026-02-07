@@ -425,6 +425,14 @@ app.listen(port, () => {
     console.log('GET    /citas/:id   -> Ver cita por id');
     console.log('GET    /citas/disponibilidad/:fecha_hora   -> Verificar disponibilidad');
 
+    // Dashboard Admin
+    console.log('DASHBOARD ADMIN 📊 (Solo rol: admin)');
+    console.log('GET    /dashboard/total-usuarios   -> Total de usuarios');
+    console.log('GET    /dashboard/total-citas   -> Total de citas');
+    console.log('GET    /dashboard/total-servicios   -> Total de servicios');
+    console.log('GET    /dashboard/citas-por-estado   -> Citas por estado');
+    console.log('GET    /dashboard/citas-por-dia   -> Citas por día');
+    console.log('GET    /dashboard/citas-por-mes   -> Citas por mes');
 });
 
 
