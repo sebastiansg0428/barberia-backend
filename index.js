@@ -283,6 +283,30 @@ app.post('/citas', async (req, res) => {
         if (!id_usuario || !id_servicio || !fecha_hora) {
             return res.status(400).json({ error: 'Debes ingresar usuario, servicio y fecha/hora.' });
         }
+
+        // Validar formato de fecha
+        const fechaRegex = /^\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}(:\d{2})?$/;
+        if (!fechaRegex.test(fecha_hora)) {
+            return res.status(400).json({ error: 'Formato de fecha inválido. Use: YYYY-MM-DD HH:mm:ss' });
+        }
+
+        // Validar que la fecha sea válida
+        const fecha = new Date(fecha_hora);
+        if (isNaN(fecha.getTime())) {
+            return res.status(400).json({ error: 'Fecha inválida.' });
+        }
+
+        // Validar que el año tenga 4 dígitos
+        const year = fecha_hora.split(/[\sT-]/)[0];
+        if (year.length !== 4) {
+            return res.status(400).json({ error: `Año inválido: ${year}. Debe tener 4 dígitos (ej: 2026).` });
+        }
+
+        const estadosValidos = ['pendiente', 'completada', 'cancelada'];
+        const estadoInicial = 'pendiente';
+        if (!estadosValidos.includes(estadoInicial)) {
+            return res.status(400).json({ error: 'Estado no válido. Debe ser: pendiente, completada o cancelada.' });
+        }
         // Validar que no exista otra cita en la misma fecha y hora
         const [existing] = await pool.promise().query(
             'SELECT id FROM citas WHERE fecha_hora = ? AND estado != ?',
@@ -293,7 +317,7 @@ app.post('/citas', async (req, res) => {
         }
         await pool.promise().query(
             'INSERT INTO citas (id_usuario, id_servicio, fecha_hora, estado, notas) VALUES (?, ?, ?, ?, ?)',
-            [id_usuario, id_servicio, fecha_hora, 'pendiente', notas || null]
+            [id_usuario, id_servicio, fecha_hora, estadoInicial, notas || null]
         );
         res.json({ mensaje: 'Cita creada exitosamente' });
     } catch (error) {
@@ -354,6 +378,29 @@ app.put('/citas/:id', async (req, res) => {
     try {
         const { id } = req.params;
         const { id_usuario, id_servicio, fecha_hora, estado, notas } = req.body;
+
+        // Validar formato de fecha si se envía
+        if (fecha_hora) {
+            const fechaRegex = /^\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}(:\d{2})?$/;
+            if (!fechaRegex.test(fecha_hora)) {
+                return res.status(400).json({ error: 'Formato de fecha inválido. Use: YYYY-MM-DD HH:mm:ss' });
+            }
+
+            const fecha = new Date(fecha_hora);
+            if (isNaN(fecha.getTime())) {
+                return res.status(400).json({ error: 'Fecha inválida.' });
+            }
+
+            const year = fecha_hora.split(/[\sT-]/)[0];
+            if (year.length !== 4) {
+                return res.status(400).json({ error: `Año inválido: ${year}. Debe tener 4 dígitos (ej: 2026).` });
+            }
+        }
+
+        const estadosValidos = ['pendiente', 'completada', 'cancelada'];
+        if (estado && !estadosValidos.includes(estado)) {
+            return res.status(400).json({ error: 'Estado no válido. Debe ser: pendiente, completada o cancelada.' });
+        }
         // Validar que no exista otra cita en la misma fecha y hora (excluyendo la cita actual)
         const [existing] = await pool.promise().query(
             'SELECT id FROM citas WHERE fecha_hora = ? AND estado != ? AND id != ?',
@@ -370,6 +417,40 @@ app.put('/citas/:id', async (req, res) => {
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al actualizar cita.' });
+    }
+});
+
+// Actualizar solo el estado de una cita (PATCH /citas/:id/estado)
+app.patch('/citas/:id/estado', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { estado } = req.body;
+
+        if (!estado) {
+            return res.status(400).json({ error: 'Debes enviar el estado.' });
+        }
+
+        const estadosValidos = ['pendiente', 'completada', 'cancelada'];
+        if (!estadosValidos.includes(estado)) {
+            return res.status(400).json({ error: 'Estado no válido. Debe ser: pendiente, completada o cancelada.' });
+        }
+
+        // Verificar que la cita existe
+        const [cita] = await pool.promise().query('SELECT id FROM citas WHERE id = ?', [id]);
+        if (cita.length === 0) {
+            return res.status(404).json({ error: 'Cita no encontrada.' });
+        }
+
+        // Actualizar solo el estado
+        await pool.promise().query(
+            'UPDATE citas SET estado = ? WHERE id = ?',
+            [estado, id]
+        );
+
+        res.json({ mensaje: 'Estado de la cita actualizado correctamente', estado });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al actualizar estado de la cita.' });
     }
 });
 
@@ -562,7 +643,8 @@ app.listen(port, () => {
     console.log('CITAS📅');
     console.log('GET    /citas   -> Listar citas');
     console.log('POST   /citas   -> Crear cita (valida disponibilidad)');
-    console.log('PUT    /citas/:id   -> Actualizar cita (valida disponibilidad)');
+    console.log('PUT    /citas/:id   -> Actualizar cita completa (valida disponibilidad)');
+    console.log('PATCH  /citas/:id/estado   -> Actualizar solo el estado de la cita');
     console.log('DELETE /citas/:id   -> Eliminar cita');
     console.log('GET    /citas/:id   -> Ver cita por id');
     console.log('GET    /citas/disponibilidad/:fecha_hora   -> Verificar disponibilidad');
