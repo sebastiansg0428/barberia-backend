@@ -423,8 +423,8 @@ app.post('/dashboard/stats', verificarRol('admin'), async (req, res) => {
         const [citasPorDia] = await pool.promise().query(`
             SELECT DATE(fecha_hora) as dia, COUNT(*) as total 
             FROM citas 
-            GROUP BY dia 
-            ORDER BY dia DESC 
+            GROUP BY DATE(fecha_hora) 
+            ORDER BY DATE(fecha_hora) DESC 
             LIMIT 30
         `);
 
@@ -432,8 +432,8 @@ app.post('/dashboard/stats', verificarRol('admin'), async (req, res) => {
         const [citasPorMes] = await pool.promise().query(`
             SELECT DATE_FORMAT(fecha_hora, '%Y-%m') as mes, COUNT(*) as total 
             FROM citas 
-            GROUP BY mes 
-            ORDER BY mes DESC 
+            GROUP BY DATE_FORMAT(fecha_hora, '%Y-%m') 
+            ORDER BY DATE_FORMAT(fecha_hora, '%Y-%m') DESC 
             LIMIT 12
         `);
 
@@ -509,8 +509,8 @@ app.post('/dashboard/citas-por-dia', verificarRol('admin'), async (req, res) => 
         const [rows] = await pool.promise().query(`
             SELECT DATE(fecha_hora) as dia, COUNT(*) as total 
             FROM citas 
-            GROUP BY dia 
-            ORDER BY dia DESC 
+            GROUP BY DATE(fecha_hora) 
+            ORDER BY DATE(fecha_hora) DESC 
             LIMIT 30
         `);
         res.json({ citasPorDia: rows || [] });
@@ -526,8 +526,8 @@ app.post('/dashboard/citas-por-mes', verificarRol('admin'), async (req, res) => 
         const [rows] = await pool.promise().query(`
             SELECT DATE_FORMAT(fecha_hora, '%Y-%m') as mes, COUNT(*) as total 
             FROM citas 
-            GROUP BY mes 
-            ORDER BY mes DESC 
+            GROUP BY DATE_FORMAT(fecha_hora, '%Y-%m') 
+            ORDER BY DATE_FORMAT(fecha_hora, '%Y-%m') DESC 
             LIMIT 12
         `);
         res.json({ citasPorMes: rows || [] });
