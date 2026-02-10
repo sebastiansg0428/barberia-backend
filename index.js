@@ -1,4 +1,4 @@
-
+require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2');
 const bcrypt = require('bcryptjs');
@@ -6,15 +6,18 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 app.use(express.json());
-const port = 3000;
+const port = process.env.PORT || 3000;
 
-// SELECT `id`, `email`, `password` FROM `usuarios` WHERE 1 //
+// Configuración de la base de datos con variables de entorno
 const pool = mysql.createPool({
-    host: 'localhost',
-    user: 'root',
-    database: 'barberia',
-    password: '',
-
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    database: process.env.DB_NAME || 'barberia',
+    password: process.env.DB_PASSWORD || '',
+    port: process.env.DB_PORT || 3306,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
 });
 
 // ==================== MIDDLEWARES DE AUTORIZACIÓN ====================
@@ -23,7 +26,10 @@ const pool = mysql.createPool({
 const verificarRol = (...rolesPermitidos) => {
     return async (req, res, next) => {
         try {
-            const { id_usuario } = req.body; // o req.params según tu implementación
+            const id_usuario =
+                (req.body && req.body.id_usuario) ||
+                (req.query && req.query.id_usuario) ||
+                req.headers['id_usuario'];
             if (!id_usuario) {
                 return res.status(400).json({ error: 'ID de usuario requerido.' });
             }
@@ -396,6 +402,142 @@ app.get('/citas/disponibilidad/:fecha_hora', async (req, res) => {
 });
 
 
+// ==================== DASHBOARD ADMIN ====================
+
+// Endpoint consolidado para todas las estadísticas del dashboard - Solo Admin
+app.post('/dashboard/stats', verificarRol('admin'), async (req, res) => {
+    try {
+        // Total de usuarios
+        const [usuarios] = await pool.promise().query('SELECT COUNT(*) as total FROM usuarios');
+
+        // Total de citas
+        const [citas] = await pool.promise().query('SELECT COUNT(*) as total FROM citas');
+
+        // Total de servicios
+        const [servicios] = await pool.promise().query('SELECT COUNT(*) as total FROM servicios');
+
+        // Citas por estado
+        const [citasPorEstado] = await pool.promise().query('SELECT estado, COUNT(*) as total FROM citas GROUP BY estado');
+
+        // Citas por día
+        const [citasPorDia] = await pool.promise().query(`
+            SELECT DATE(fecha_hora) as dia, COUNT(*) as total 
+            FROM citas 
+            GROUP BY dia 
+            ORDER BY dia DESC 
+            LIMIT 30
+        `);
+
+        // Citas por mes
+        const [citasPorMes] = await pool.promise().query(`
+            SELECT DATE_FORMAT(fecha_hora, '%Y-%m') as mes, COUNT(*) as total 
+            FROM citas 
+            GROUP BY mes 
+            ORDER BY mes DESC 
+            LIMIT 12
+        `);
+
+        res.json({
+            totalUsuarios: usuarios[0]?.total || 0,
+            totalCitas: citas[0]?.total || 0,
+            totalServicios: servicios[0]?.total || 0,
+            citasPorEstado: citasPorEstado || [],
+            citasPorDia: citasPorDia || [],
+            citasPorMes: citasPorMes || []
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            error: 'Error al obtener estadísticas del dashboard.',
+            totalUsuarios: 0,
+            totalCitas: 0,
+            totalServicios: 0,
+            citasPorEstado: [],
+            citasPorDia: [],
+            citasPorMes: []
+        });
+    }
+});
+
+// Total de usuarios (POST /dashboard/total-usuarios) - Solo Admin
+app.post('/dashboard/total-usuarios', verificarRol('admin'), async (req, res) => {
+    try {
+        const [rows] = await pool.promise().query('SELECT COUNT(*) as total FROM usuarios');
+        res.json({ totalUsuarios: rows[0]?.total || 0 });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al obtener total de usuarios.', totalUsuarios: 0 });
+    }
+});
+
+// Total de citas (POST /dashboard/total-citas) - Solo Admin
+app.post('/dashboard/total-citas', verificarRol('admin'), async (req, res) => {
+    try {
+        const [rows] = await pool.promise().query('SELECT COUNT(*) as total FROM citas');
+        res.json({ totalCitas: rows[0]?.total || 0 });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al obtener total de citas.', totalCitas: 0 });
+    }
+});
+
+// Total de servicios (POST /dashboard/total-servicios) - Solo Admin
+app.post('/dashboard/total-servicios', verificarRol('admin'), async (req, res) => {
+    try {
+        const [rows] = await pool.promise().query('SELECT COUNT(*) as total FROM servicios');
+        res.json({ totalServicios: rows[0]?.total || 0 });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al obtener total de servicios.', totalServicios: 0 });
+    }
+});
+
+// Citas por estado (POST /dashboard/citas-por-estado) - Solo Admin
+app.post('/dashboard/citas-por-estado', verificarRol('admin'), async (req, res) => {
+    try {
+        const [rows] = await pool.promise().query('SELECT estado, COUNT(*) as total FROM citas GROUP BY estado');
+        res.json({ citasPorEstado: rows || [] });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al obtener citas por estado.', citasPorEstado: [] });
+    }
+});
+
+// Citas por día (POST /dashboard/citas-por-dia) - Solo Admin
+app.post('/dashboard/citas-por-dia', verificarRol('admin'), async (req, res) => {
+    try {
+        const [rows] = await pool.promise().query(`
+            SELECT DATE(fecha_hora) as dia, COUNT(*) as total 
+            FROM citas 
+            GROUP BY dia 
+            ORDER BY dia DESC 
+            LIMIT 30
+        `);
+        res.json({ citasPorDia: rows || [] });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al obtener citas por día.', citasPorDia: [] });
+    }
+});
+
+// Citas por mes (POST /dashboard/citas-por-mes) - Solo Admin
+app.post('/dashboard/citas-por-mes', verificarRol('admin'), async (req, res) => {
+    try {
+        const [rows] = await pool.promise().query(`
+            SELECT DATE_FORMAT(fecha_hora, '%Y-%m') as mes, COUNT(*) as total 
+            FROM citas 
+            GROUP BY mes 
+            ORDER BY mes DESC 
+            LIMIT 12
+        `);
+        res.json({ citasPorMes: rows || [] });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al obtener citas por mes.', citasPorMes: [] });
+    }
+});
+
+
 app.listen(port, () => {
     console.log(`Servidor de Barbería escuchando en http://localhost:${port}`);
     console.log('RUTAS DISPONIBLES 🚌:');
@@ -427,12 +569,13 @@ app.listen(port, () => {
 
     // Dashboard Admin
     console.log('DASHBOARD ADMIN 📊 (Solo rol: admin)');
-    console.log('GET    /dashboard/total-usuarios   -> Total de usuarios');
-    console.log('GET    /dashboard/total-citas   -> Total de citas');
-    console.log('GET    /dashboard/total-servicios   -> Total de servicios');
-    console.log('GET    /dashboard/citas-por-estado   -> Citas por estado');
-    console.log('GET    /dashboard/citas-por-dia   -> Citas por día');
-    console.log('GET    /dashboard/citas-por-mes   -> Citas por mes');
+    console.log('POST   /dashboard/stats   -> Todas las estadísticas (recomendado)');
+    console.log('POST   /dashboard/total-usuarios   -> Total de usuarios');
+    console.log('POST   /dashboard/total-citas   -> Total de citas');
+    console.log('POST   /dashboard/total-servicios   -> Total de servicios');
+    console.log('POST   /dashboard/citas-por-estado   -> Citas por estado');
+    console.log('POST   /dashboard/citas-por-dia   -> Citas por día');
+    console.log('POST   /dashboard/citas-por-mes   -> Citas por mes');
 });
 
 

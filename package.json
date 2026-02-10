@@ -1,7 +1,17 @@
 {
+  "name": "barberia-backend",
+  "version": "1.0.0",
+  "description": "Backend API para sistema de barbería",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "test:connection": "node test-connection.js"
+  },
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
+    "dotenv": "^16.4.5",
     "express": "^5.2.1",
     "mysql2": "^3.16.1"
   }
