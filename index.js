@@ -545,16 +545,6 @@ app.get('/pagos/cita/:id_cita', async (req, res) => {
 });
 
 
-
-
-
-
-
-
-
-
-
-
 // ==================== DASHBOARD ADMIN ====================
 
 // Endpoint consolidado para todas las estadísticas del dashboard - Solo Admin
@@ -690,12 +680,69 @@ app.post('/dashboard/citas-por-mes', verificarRol('admin'), async (req, res) => 
     }
 });
 
+// ==================== DASHBOARD PAGOS ====================
+
+// Endpoint consolidado para estadísticas de pagos - Solo Admin
+app.post('/dashboard/pagos-stats', verificarRol('admin'), async (req, res) => {
+    try {
+        // Total de pagos
+        const [totalPagosRows] = await pool.promise().query('SELECT COUNT(*) as total FROM pagos');
+        const totalPagos = totalPagosRows[0]?.total || 0;
+
+        // Total monto pagado
+        const [totalMontoRows] = await pool.promise().query('SELECT SUM(monto) as totalMonto FROM pagos');
+        const totalMontoPagado = totalMontoRows[0]?.totalMonto || 0;
+
+        // Pagos por método
+        const [pagosPorMetodoRows] = await pool.promise().query('SELECT metodo, COUNT(*) as total, SUM(monto) as montoTotal FROM pagos GROUP BY metodo');
+        const pagosPorMetodo = pagosPorMetodoRows || [];
+
+        // Pagos por mes
+        const [pagosPorMesRows] = await pool.promise().query(`
+            SELECT DATE_FORMAT(fecha_pago, '%Y-%m') as mes, COUNT(*) as total, SUM(monto) as montoTotal
+            FROM pagos
+            GROUP BY DATE_FORMAT(fecha_pago, '%Y-%m')
+            ORDER BY mes DESC
+            LIMIT 12
+        `);
+        const pagosPorMes = pagosPorMesRows || [];
+
+        // Pagos por día
+        const [pagosPorDiaRows] = await pool.promise().query(`
+            SELECT DATE(fecha_pago) as dia, COUNT(*) as total, SUM(monto) as montoTotal
+            FROM pagos
+            GROUP BY DATE(fecha_pago)
+            ORDER BY dia DESC
+            LIMIT 30
+        `);
+        const pagosPorDia = pagosPorDiaRows || [];
+
+        res.json({
+            totalPagos,
+            totalMontoPagado,
+            pagosPorMetodo,
+            pagosPorMes,
+            pagosPorDia
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            error: 'Error al obtener estadísticas de pagos.',
+            totalPagos: 0,
+            totalMontoPagado: 0,
+            pagosPorMetodo: [],
+            pagosPorMes: [],
+            pagosPorDia: []
+        });
+    }
+});
 
 app.listen(port, () => {
     console.log(`Servidor de Barbería escuchando en http://localhost:${port}`);
     console.log('RUTAS DISPONIBLES 🚌:');
     console.log('POST   /register   -> Registrar usuario');
     console.log('POST   /login      -> Iniciar sesión');
+
     // Listar usuarios
     console.log('USUARIOS⚙️');
     console.log('GET    /usuarios   -> Listar usuarios');
@@ -730,12 +777,14 @@ app.listen(port, () => {
     console.log('POST   /dashboard/citas-por-estado   -> Citas por estado');
     console.log('POST   /dashboard/citas-por-dia   -> Citas por día');
     console.log('POST   /dashboard/citas-por-mes   -> Citas por mes');
+    console.log('POST   /dashboard/pagos-stats   -> Estadísticas de pagos');
+
 
 
     // ==================== PAGOS CRUD ====================
     console.log('PAGOS 💸');
     console.log('POST   /pagos   -> Registrar pago');
-    console.log('GET    /pagos   -> Listar todos los pagos');    
+    console.log('GET    /pagos   -> Listar todos los pagos');
     console.log('GET    /pagos/:id   -> Ver pago por id');
     console.log('GET    /pagos/cita/:id_cita   -> Ver pagos de una cita');
 });
