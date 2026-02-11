@@ -482,6 +482,78 @@ app.get('/citas/disponibilidad/:fecha_hora', async (req, res) => {
     }
 });
 
+// ==================== PAGOS CRUD ====================
+
+// Registrar pago (POST /pagos)
+app.post('/pagos', async (req, res) => {
+    try {
+        const { id_cita, monto, metodo, fecha_pago } = req.body;
+        if (!id_cita || !monto || !metodo || !fecha_pago) {
+            return res.status(400).json({ error: 'Faltan datos obligatorios.' });
+        }
+        await pool.promise().query(
+            'INSERT INTO pagos (id_cita, monto, metodo, fecha_pago) VALUES (?, ?, ?, ?)',
+            [id_cita, monto, metodo, fecha_pago]
+        );
+        res.json({ mensaje: 'Pago registrado exitosamente' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al registrar pago.' });
+    }
+});
+
+// Listar todos los pagos (GET /pagos)
+app.get('/pagos', async (req, res) => {
+    try {
+        const [rows] = await pool.promise().query(`
+            SELECT pagos.*, citas.id_usuario
+            FROM pagos
+            JOIN citas ON pagos.id_cita = citas.id
+        `);
+        res.status(200).json({ pagos: rows });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar pagos.' });
+    }
+});
+
+// Ver pago por id (GET /pagos/:id)
+app.get('/pagos/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const [rows] = await pool.promise().query('SELECT * FROM pagos WHERE id = ?', [id]);
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Pago no encontrado.' });
+        }
+        res.status(200).json({ pago: rows[0] });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar pago.' });
+    }
+});
+
+// Ver pagos de una cita (GET /pagos/cita/:id_cita)
+app.get('/pagos/cita/:id_cita', async (req, res) => {
+    try {
+        const { id_cita } = req.params;
+        const [rows] = await pool.promise().query('SELECT * FROM pagos WHERE id_cita = ?', [id_cita]);
+        res.status(200).json({ pagos: rows });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar pagos de la cita.' });
+    }
+});
+
+
+
+
+
+
+
+
+
+
+
 
 // ==================== DASHBOARD ADMIN ====================
 
@@ -658,6 +730,14 @@ app.listen(port, () => {
     console.log('POST   /dashboard/citas-por-estado   -> Citas por estado');
     console.log('POST   /dashboard/citas-por-dia   -> Citas por día');
     console.log('POST   /dashboard/citas-por-mes   -> Citas por mes');
+
+
+    // ==================== PAGOS CRUD ====================
+    console.log('PAGOS 💸');
+    console.log('POST   /pagos   -> Registrar pago');
+    console.log('GET    /pagos   -> Listar todos los pagos');    
+    console.log('GET    /pagos/:id   -> Ver pago por id');
+    console.log('GET    /pagos/cita/:id_cita   -> Ver pagos de una cita');
 });
 
 
