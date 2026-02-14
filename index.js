@@ -188,13 +188,52 @@ app.put('/usuarios/:id', async (req, res) => {
 
 // Eliminar usuario por id
 app.delete('/usuarios/:id', async (req, res) => {
+    let connection;
     try {
         const { id } = req.params;
-        await pool.promise().query('DELETE FROM usuarios WHERE id = ?', [id]);
-        res.json({ mensaje: 'Usuario eliminado correctamente' });
+        console.log('🗑️ Intentando eliminar usuario con ID:', id);
+
+        connection = await pool.promise().getConnection();
+
+        // Iniciar transacción
+        await connection.beginTransaction();
+        console.log('✅ Transacción iniciada');
+
+        // 1. Obtener las citas del usuario
+        const [citas] = await connection.query('SELECT id FROM citas WHERE id_usuario = ?', [id]);
+        console.log(`📋 Citas encontradas para usuario ${id}:`, citas.length);
+
+        // 2. Eliminar pagos asociados a las citas del usuario
+        if (citas.length > 0) {
+            const citaIds = citas.map(c => c.id);
+            console.log('💰 IDs de citas a eliminar pagos:', citaIds);
+            const placeholders = citaIds.map(() => '?').join(',');
+            const [resultPagos] = await connection.query(`DELETE FROM pagos WHERE id_cita IN (${placeholders})`, citaIds);
+            console.log('✅ Pagos eliminados:', resultPagos.affectedRows);
+        }
+
+        // 3. Eliminar citas del usuario
+        const [resultCitas] = await connection.query('DELETE FROM citas WHERE id_usuario = ?', [id]);
+        console.log('✅ Citas eliminadas:', resultCitas.affectedRows);
+
+        // 4. Eliminar el usuario
+        const [resultUsuario] = await connection.query('DELETE FROM usuarios WHERE id = ?', [id]);
+        console.log('✅ Usuario eliminado:', resultUsuario.affectedRows);
+
+        // Confirmar transacción
+        await connection.commit();
+        console.log('✅ Transacción confirmada');
+        connection.release();
+
+        res.json({ mensaje: 'Usuario eliminado correctamente junto con sus citas y pagos.' });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Error al eliminar usuario.' });
+        console.error('❌ Error al eliminar usuario:', error.message);
+        console.error('Stack completo:', error);
+        if (connection) {
+            await connection.rollback();
+            connection.release();
+        }
+        res.status(500).json({ error: 'Error al eliminar usuario: ' + error.message });
     }
 });
 
@@ -276,12 +315,21 @@ app.delete('/servicios/:id', async (req, res) => {
 
 // ==================== CITAS CRUD ====================
 
-// Crear cita (POST /citas)
+// Crear cita (POST /citas) con opción de pago
 app.post('/citas', async (req, res) => {
+    const connection = await pool.promise().getConnection();
     try {
-        const { id_usuario, id_servicio, fecha_hora, notas } = req.body;
+        const { id_usuario, id_servicio, fecha_hora, notas, metodo_pago } = req.body;
         if (!id_usuario || !id_servicio || !fecha_hora) {
             return res.status(400).json({ error: 'Debes ingresar usuario, servicio y fecha/hora.' });
+        }
+
+        // Validar método de pago si se proporciona
+        if (metodo_pago) {
+            const metodosValidos = ['efectivo', 'transferencia', 'tarjeta'];
+            if (!metodosValidos.includes(metodo_pago)) {
+                return res.status(400).json({ error: 'Método de pago no válido. Debe ser: efectivo, transferencia o tarjeta.' });
+            }
         }
 
         // Validar formato de fecha
@@ -307,20 +355,64 @@ app.post('/citas', async (req, res) => {
         if (!estadosValidos.includes(estadoInicial)) {
             return res.status(400).json({ error: 'Estado no válido. Debe ser: pendiente, completada o cancelada.' });
         }
+
         // Validar que no exista otra cita en la misma fecha y hora
-        const [existing] = await pool.promise().query(
+        const [existing] = await connection.query(
             'SELECT id FROM citas WHERE fecha_hora = ? AND estado != ?',
             [fecha_hora, 'cancelada']
         );
         if (existing.length > 0) {
+            connection.release();
             return res.status(409).json({ error: 'Ya existe una cita para esta fecha y hora.' });
         }
-        await pool.promise().query(
+
+        // Iniciar transacción
+        await connection.beginTransaction();
+
+        // Crear la cita
+        const [citaResult] = await connection.query(
             'INSERT INTO citas (id_usuario, id_servicio, fecha_hora, estado, notas) VALUES (?, ?, ?, ?, ?)',
             [id_usuario, id_servicio, fecha_hora, estadoInicial, notas || null]
         );
-        res.json({ mensaje: 'Cita creada exitosamente' });
+
+        const id_cita = citaResult.insertId;
+
+        // Si se proporcionó método de pago, crear el pago automáticamente
+        if (metodo_pago) {
+            // Obtener el precio del servicio
+            const [servicio] = await connection.query(
+                'SELECT precio FROM servicios WHERE id = ?',
+                [id_servicio]
+            );
+
+            if (servicio.length === 0) {
+                await connection.rollback();
+                connection.release();
+                return res.status(404).json({ error: 'Servicio no encontrado.' });
+            }
+
+            const monto = servicio[0].precio;
+            const fecha_pago = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+            // Registrar el pago
+            await connection.query(
+                'INSERT INTO pagos (id_cita, monto, metodo, fecha_pago) VALUES (?, ?, ?, ?)',
+                [id_cita, monto, metodo_pago, fecha_pago]
+            );
+        }
+
+        // Confirmar transacción
+        await connection.commit();
+        connection.release();
+
+        res.json({
+            mensaje: 'Cita creada exitosamente' + (metodo_pago ? ' y pago registrado' : ''),
+            id_cita,
+            pago_registrado: !!metodo_pago
+        });
     } catch (error) {
+        await connection.rollback();
+        connection.release();
         console.error(error);
         res.status(500).json({ error: 'Error al crear cita.' });
     }
@@ -506,23 +598,33 @@ app.post('/pagos', async (req, res) => {
 app.get('/pagos', async (req, res) => {
     try {
         const { id_usuario } = req.query;
-        console.log('🔍 Filtrando pagos por id_usuario:', id_usuario);
+
         let query = `
-            SELECT pagos.*, servicios.nombre AS nombre_servicio, usuarios.nombre AS nombre_cliente
+            SELECT 
+                pagos.id,
+                pagos.id_cita,
+                pagos.monto,
+                pagos.metodo,
+                pagos.fecha_pago,
+                citas.id_usuario,
+                servicios.nombre AS nombre_servicio,
+                usuarios.nombre AS nombre_cliente
             FROM pagos
-            JOIN citas ON pagos.id_cita = citas.id
-            JOIN servicios ON citas.id_servicio = servicios.id
-            JOIN usuarios ON citas.id_usuario = usuarios.id
+            INNER JOIN citas ON pagos.id_cita = citas.id
+            INNER JOIN servicios ON citas.id_servicio = servicios.id
+            INNER JOIN usuarios ON citas.id_usuario = usuarios.id
         `;
+
         let params = [];
+
         if (id_usuario) {
             query += ' WHERE citas.id_usuario = ?';
-            params.push(id_usuario);
+            params.push(parseInt(id_usuario));
         }
-        console.log('📋 Query ejecutado:', query);
-        console.log('📋 Params:', params);
+
+        query += ' ORDER BY pagos.fecha_pago DESC';
+
         const [rows] = await pool.promise().query(query, params);
-        console.log('✅ Resultados encontrados:', rows.length);
         res.status(200).json({ pagos: rows });
     } catch (error) {
         console.error(error);
