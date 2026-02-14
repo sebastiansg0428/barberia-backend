@@ -505,13 +505,24 @@ app.post('/pagos', async (req, res) => {
 // Listar todos los pagos (GET /pagos)
 app.get('/pagos', async (req, res) => {
     try {
-        const [rows] = await pool.promise().query(`
-           SELECT pagos.*, servicios.nombre AS nombre_servicio, usuarios.nombre AS nombre_cliente
+        const { id_usuario } = req.query;
+        console.log('🔍 Filtrando pagos por id_usuario:', id_usuario);
+        let query = `
+            SELECT pagos.*, servicios.nombre AS nombre_servicio, usuarios.nombre AS nombre_cliente
             FROM pagos
             JOIN citas ON pagos.id_cita = citas.id
             JOIN servicios ON citas.id_servicio = servicios.id
             JOIN usuarios ON citas.id_usuario = usuarios.id
-        `);
+        `;
+        let params = [];
+        if (id_usuario) {
+            query += ' WHERE citas.id_usuario = ?';
+            params.push(id_usuario);
+        }
+        console.log('📋 Query ejecutado:', query);
+        console.log('📋 Params:', params);
+        const [rows] = await pool.promise().query(query, params);
+        console.log('✅ Resultados encontrados:', rows.length);
         res.status(200).json({ pagos: rows });
     } catch (error) {
         console.error(error);
