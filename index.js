@@ -527,11 +527,12 @@ app.patch('/citas/:id/estado', async (req, res) => {
             return res.status(400).json({ error: 'Estado no válido. Debe ser: pendiente, completada o cancelada.' });
         }
 
-        // Verificar que la cita existe
-        const [cita] = await pool.promise().query('SELECT id FROM citas WHERE id = ?', [id]);
-        if (cita.length === 0) {
+        // Verificar que la cita existe y obtener info relevante
+        const [citaRows] = await pool.promise().query('SELECT * FROM citas WHERE id = ?', [id]);
+        if (citaRows.length === 0) {
             return res.status(404).json({ error: 'Cita no encontrada.' });
         }
+        const cita = citaRows[0];
 
         // Actualizar solo el estado
         await pool.promise().query(
@@ -539,7 +540,33 @@ app.patch('/citas/:id/estado', async (req, res) => {
             [estado, id]
         );
 
-        res.json({ mensaje: 'Estado de la cita actualizado correctamente', estado });
+        let pagoRegistrado = false;
+        let pagoId = null;
+
+        // Si el nuevo estado es 'completada', verificar y registrar pago si no existe
+        if (estado === 'completada') {
+            // Verificar si ya existe un pago para esta cita
+            const [pagos] = await pool.promise().query('SELECT id FROM pagos WHERE id_cita = ?', [id]);
+            if (pagos.length === 0) {
+                // No existe pago, registrar uno automáticamente
+                // Obtener el precio del servicio
+                const [servicioRows] = await pool.promise().query('SELECT precio FROM servicios WHERE id = ?', [cita.id_servicio]);
+                if (servicioRows.length === 0) {
+                    return res.status(404).json({ error: 'Servicio no encontrado para la cita.' });
+                }
+                const monto = servicioRows[0].precio;
+                const fecha_pago = new Date().toISOString().slice(0, 19).replace('T', ' ');
+                const metodo = 'efectivo'; // Por defecto, puedes cambiarlo si lo deseas
+                const [pagoResult] = await pool.promise().query(
+                    'INSERT INTO pagos (id_cita, monto, metodo, fecha_pago) VALUES (?, ?, ?, ?)',
+                    [id, monto, metodo, fecha_pago]
+                );
+                pagoRegistrado = true;
+                pagoId = pagoResult.insertId;
+            }
+        }
+
+        res.json({ mensaje: 'Estado de la cita actualizado correctamente', estado, pagoRegistrado, pagoId });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al actualizar estado de la cita.' });
@@ -800,33 +827,53 @@ app.post('/dashboard/citas-por-mes', verificarRol('admin'), async (req, res) => 
 // Endpoint consolidado para estadísticas de pagos - Solo Admin
 app.post('/dashboard/pagos-stats', verificarRol('admin'), async (req, res) => {
     try {
-        // Total de pagos
-        const [totalPagosRows] = await pool.promise().query('SELECT COUNT(*) as total FROM pagos');
+        // Total de pagos (solo de citas completadas)
+        const [totalPagosRows] = await pool.promise().query(`
+            SELECT COUNT(*) as total
+            FROM pagos
+            INNER JOIN citas ON pagos.id_cita = citas.id
+            WHERE citas.estado = 'completada'
+        `);
         const totalPagos = totalPagosRows[0]?.total || 0;
 
-        // Total monto pagado
-        const [totalMontoRows] = await pool.promise().query('SELECT SUM(monto) as totalMonto FROM pagos');
+        // Total monto pagado (solo de citas completadas)
+        const [totalMontoRows] = await pool.promise().query(`
+            SELECT SUM(pagos.monto) as totalMonto
+            FROM pagos
+            INNER JOIN citas ON pagos.id_cita = citas.id
+            WHERE citas.estado = 'completada'
+        `);
         const totalMontoPagado = totalMontoRows[0]?.totalMonto || 0;
 
-        // Pagos por método
-        const [pagosPorMetodoRows] = await pool.promise().query('SELECT metodo, COUNT(*) as total, SUM(monto) as montoTotal FROM pagos GROUP BY metodo');
+        // Pagos por método (solo de citas completadas)
+        const [pagosPorMetodoRows] = await pool.promise().query(`
+            SELECT pagos.metodo, COUNT(*) as total, SUM(pagos.monto) as montoTotal
+            FROM pagos
+            INNER JOIN citas ON pagos.id_cita = citas.id
+            WHERE citas.estado = 'completada'
+            GROUP BY pagos.metodo
+        `);
         const pagosPorMetodo = pagosPorMetodoRows || [];
 
-        // Pagos por mes
+        // Pagos por mes (solo de citas completadas)
         const [pagosPorMesRows] = await pool.promise().query(`
-            SELECT DATE_FORMAT(fecha_pago, '%Y-%m') as mes, COUNT(*) as total, SUM(monto) as montoTotal
+            SELECT DATE_FORMAT(pagos.fecha_pago, '%Y-%m') as mes, COUNT(*) as total, SUM(pagos.monto) as montoTotal
             FROM pagos
-            GROUP BY DATE_FORMAT(fecha_pago, '%Y-%m')
+            INNER JOIN citas ON pagos.id_cita = citas.id
+            WHERE citas.estado = 'completada'
+            GROUP BY DATE_FORMAT(pagos.fecha_pago, '%Y-%m')
             ORDER BY mes DESC
             LIMIT 12
         `);
         const pagosPorMes = pagosPorMesRows || [];
 
-        // Pagos por día
+        // Pagos por día (solo de citas completadas)
         const [pagosPorDiaRows] = await pool.promise().query(`
-            SELECT DATE(fecha_pago) as dia, COUNT(*) as total, SUM(monto) as montoTotal
+            SELECT DATE(pagos.fecha_pago) as dia, COUNT(*) as total, SUM(pagos.monto) as montoTotal
             FROM pagos
-            GROUP BY DATE(fecha_pago)
+            INNER JOIN citas ON pagos.id_cita = citas.id
+            WHERE citas.estado = 'completada'
+            GROUP BY DATE(pagos.fecha_pago)
             ORDER BY dia DESC
             LIMIT 30
         `);
