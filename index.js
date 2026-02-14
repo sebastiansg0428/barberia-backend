@@ -506,9 +506,11 @@ app.post('/pagos', async (req, res) => {
 app.get('/pagos', async (req, res) => {
     try {
         const [rows] = await pool.promise().query(`
-            SELECT pagos.*, citas.id_usuario
+           SELECT pagos.*, servicios.nombre AS nombre_servicio, usuarios.nombre AS nombre_cliente
             FROM pagos
             JOIN citas ON pagos.id_cita = citas.id
+            JOIN servicios ON citas.id_servicio = servicios.id
+            JOIN usuarios ON citas.id_usuario = usuarios.id
         `);
         res.status(200).json({ pagos: rows });
     } catch (error) {
