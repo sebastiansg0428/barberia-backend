@@ -575,13 +575,34 @@ app.patch('/citas/:id/estado', async (req, res) => {
 
 // Eliminar cita por id (DELETE /citas/:id)
 app.delete('/citas/:id', async (req, res) => {
+    let connection;
     try {
         const { id } = req.params;
-        await pool.promise().query('DELETE FROM citas WHERE id = ?', [id]);
+        connection = await pool.promise().getConnection();
+        await connection.beginTransaction();
+
+        // 1. Eliminar pagos asociados a la cita
+        await connection.query('DELETE FROM pagos WHERE id_cita = ?', [id]);
+
+        // 2. Eliminar la cita
+        const [result] = await connection.query('DELETE FROM citas WHERE id = ?', [id]);
+
+        if (result.affectedRows === 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(404).json({ error: 'Cita no encontrada.' });
+        }
+
+        await connection.commit();
+        connection.release();
         res.json({ mensaje: 'Cita eliminada correctamente' });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Error al eliminar cita.' });
+        if (connection) {
+            await connection.rollback();
+            connection.release();
+        }
+        console.error('❌ Error al eliminar cita:', error.message);
+        res.status(500).json({ error: 'Error al eliminar cita: ' + error.message });
     }
 });
 
