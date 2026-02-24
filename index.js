@@ -247,9 +247,16 @@ app.post('/servicios', async (req, res) => {
         if (!nombre || !precio) {
             return res.status(400).json({ error: 'Debes ingresar nombre y precio del servicio.' });
         }
+        // Validar duracion: debe ser un entero positivo (en minutos)
+        if (duracion !== undefined && duracion !== null && duracion !== '') {
+            const duracionNum = parseInt(duracion);
+            if (isNaN(duracionNum) || duracionNum <= 0 || !Number.isInteger(Number(duracion))) {
+                return res.status(400).json({ error: 'La duración debe ser un número entero positivo (en minutos).' });
+            }
+        }
         await pool.promise().query(
             'INSERT INTO servicios (nombre, descripcion, precio, duracion) VALUES (?, ?, ?, ?)',
-            [nombre, descripcion || null, precio, duracion || null]
+            [nombre, descripcion || null, precio, duracion ? parseInt(duracion) : null]
         );
         res.json({ mensaje: 'Servicio creado exitosamente' });
     } catch (error) {
@@ -289,9 +296,16 @@ app.put('/servicios/:id', async (req, res) => {
     try {
         const { id } = req.params;
         const { nombre, descripcion, precio, duracion } = req.body;
+        // Validar duracion: debe ser un entero positivo (en minutos)
+        if (duracion !== undefined && duracion !== null && duracion !== '') {
+            const duracionNum = parseInt(duracion);
+            if (isNaN(duracionNum) || duracionNum <= 0 || !Number.isInteger(Number(duracion))) {
+                return res.status(400).json({ error: 'La duración debe ser un número entero positivo (en minutos).' });
+            }
+        }
         await pool.promise().query(
             'UPDATE servicios SET nombre = ?, descripcion = ?, precio = ?, duracion = ? WHERE id = ?',
-            [nombre, descripcion, precio, duracion, id]
+            [nombre, descripcion, precio, duracion ? parseInt(duracion) : null, id]
         );
         res.json({ mensaje: 'Servicio actualizado correctamente' });
     } catch (error) {
@@ -356,14 +370,30 @@ app.post('/citas', async (req, res) => {
             return res.status(400).json({ error: 'Estado no válido. Debe ser: pendiente, completada o cancelada.' });
         }
 
-        // Validar que no exista otra cita en la misma fecha y hora
-        const [existing] = await connection.query(
-            'SELECT id FROM citas WHERE fecha_hora = ? AND estado != ?',
-            [fecha_hora, 'cancelada']
+        // Obtener el servicio (duracion en minutos y precio)
+        const [servicioCheck] = await connection.query(
+            'SELECT duracion, precio FROM servicios WHERE id = ?',
+            [id_servicio]
         );
+        if (servicioCheck.length === 0) {
+            connection.release();
+            return res.status(404).json({ error: 'Servicio no encontrado.' });
+        }
+        const duracionNueva = servicioCheck[0].duracion || 0;
+        const precioServicio = servicioCheck[0].precio;
+
+        // Verificar solapamiento de horarios considerando la duración de cada servicio
+        // Conflicto si: nueva_inicio < existente_fin AND nueva_fin > existente_inicio
+        const [existing] = await connection.query(`
+            SELECT c.id FROM citas c
+            INNER JOIN servicios s ON c.id_servicio = s.id
+            WHERE c.estado != 'cancelada'
+            AND ? < DATE_ADD(c.fecha_hora, INTERVAL COALESCE(s.duracion, 0) MINUTE)
+            AND DATE_ADD(?, INTERVAL ? MINUTE) > c.fecha_hora
+        `, [fecha_hora, fecha_hora, duracionNueva]);
         if (existing.length > 0) {
             connection.release();
-            return res.status(409).json({ error: 'Ya existe una cita para esta fecha y hora.' });
+            return res.status(409).json({ error: 'El horario se solapa con otra cita existente.' });
         }
 
         // Iniciar transacción
@@ -379,25 +409,13 @@ app.post('/citas', async (req, res) => {
 
         // Si se proporcionó método de pago, crear el pago automáticamente
         if (metodo_pago) {
-            // Obtener el precio del servicio
-            const [servicio] = await connection.query(
-                'SELECT precio FROM servicios WHERE id = ?',
-                [id_servicio]
-            );
+            const monto = precioServicio;
+            const fecha = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
-            if (servicio.length === 0) {
-                await connection.rollback();
-                connection.release();
-                return res.status(404).json({ error: 'Servicio no encontrado.' });
-            }
-
-            const monto = servicio[0].precio;
-            const fecha_pago = new Date().toISOString().slice(0, 19).replace('T', ' ');
-
-            // Registrar el pago
+            // Registrar el pago con estado 'pendiente' (admin debe aprobar)
             await connection.query(
-                'INSERT INTO pagos (id_cita, monto, metodo, fecha_pago) VALUES (?, ?, ?, ?)',
-                [id_cita, monto, metodo_pago, fecha_pago]
+                "INSERT INTO pagos (id_cita, id_usuario, monto, metodo, estado, fecha) VALUES (?, ?, ?, ?, 'pendiente', ?)",
+                [id_cita, id_usuario, monto, metodo_pago, fecha]
             );
         }
 
@@ -423,14 +441,18 @@ app.post('/citas', async (req, res) => {
 app.get('/citas', async (req, res) => {
     try {
         const [rows] = await pool.promise().query(`
-            SELECT c.id, c.id_usuario, c.id_servicio, 
-                   DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') as fecha_hora, 
+            SELECT c.id, c.id_usuario, c.id_servicio,
+                   DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') as fecha_hora,
                    c.estado, c.notas,
                    u.nombre as nombre_usuario, u.email, u.telefono,
-                   s.nombre as nombre_servicio, s.precio, s.duracion
+                   s.nombre as nombre_servicio, s.precio, s.duracion,
+                   p.id AS id_pago,
+                   p.estado AS estado_pago,
+                   p.metodo AS metodo_pago
             FROM citas c
             INNER JOIN usuarios u ON c.id_usuario = u.id
             INNER JOIN servicios s ON c.id_servicio = s.id
+            LEFT JOIN pagos p ON p.id_cita = c.id AND p.estado = 'aprobado'
             ORDER BY c.fecha_hora DESC
         `);
         res.status(200).json({ citas: rows });
@@ -493,13 +515,27 @@ app.put('/citas/:id', async (req, res) => {
         if (estado && !estadosValidos.includes(estado)) {
             return res.status(400).json({ error: 'Estado no válido. Debe ser: pendiente, completada o cancelada.' });
         }
-        // Validar que no exista otra cita en la misma fecha y hora (excluyendo la cita actual)
-        const [existing] = await pool.promise().query(
-            'SELECT id FROM citas WHERE fecha_hora = ? AND estado != ? AND id != ?',
-            [fecha_hora, 'cancelada', id]
+        // Obtener la duración del servicio (en minutos)
+        const [servicioCheck] = await pool.promise().query(
+            'SELECT duracion FROM servicios WHERE id = ?',
+            [id_servicio]
         );
+        if (servicioCheck.length === 0) {
+            return res.status(404).json({ error: 'Servicio no encontrado.' });
+        }
+        const duracionNueva = servicioCheck[0].duracion || 0;
+
+        // Verificar solapamiento excluyendo la cita actual (al editar)
+        const [existing] = await pool.promise().query(`
+            SELECT c.id FROM citas c
+            INNER JOIN servicios s ON c.id_servicio = s.id
+            WHERE c.estado != 'cancelada'
+            AND c.id != ?
+            AND ? < DATE_ADD(c.fecha_hora, INTERVAL COALESCE(s.duracion, 0) MINUTE)
+            AND DATE_ADD(?, INTERVAL ? MINUTE) > c.fecha_hora
+        `, [id, fecha_hora, fecha_hora, duracionNueva]);
         if (existing.length > 0) {
-            return res.status(409).json({ error: 'Ya existe una cita para esta fecha y hora.' });
+            return res.status(409).json({ error: 'El horario se solapa con otra cita existente.' });
         }
         await pool.promise().query(
             'UPDATE citas SET id_usuario = ?, id_servicio = ?, fecha_hora = ?, estado = ?, notas = ? WHERE id = ?',
@@ -540,33 +576,8 @@ app.patch('/citas/:id/estado', async (req, res) => {
             [estado, id]
         );
 
-        let pagoRegistrado = false;
-        let pagoId = null;
-
-        // Si el nuevo estado es 'completada', verificar y registrar pago si no existe
-        if (estado === 'completada') {
-            // Verificar si ya existe un pago para esta cita
-            const [pagos] = await pool.promise().query('SELECT id FROM pagos WHERE id_cita = ?', [id]);
-            if (pagos.length === 0) {
-                // No existe pago, registrar uno automáticamente
-                // Obtener el precio del servicio
-                const [servicioRows] = await pool.promise().query('SELECT precio FROM servicios WHERE id = ?', [cita.id_servicio]);
-                if (servicioRows.length === 0) {
-                    return res.status(404).json({ error: 'Servicio no encontrado para la cita.' });
-                }
-                const monto = servicioRows[0].precio;
-                const fecha_pago = new Date().toISOString().slice(0, 19).replace('T', ' ');
-                const metodo = 'efectivo'; // Por defecto, puedes cambiarlo si lo deseas
-                const [pagoResult] = await pool.promise().query(
-                    'INSERT INTO pagos (id_cita, monto, metodo, fecha_pago) VALUES (?, ?, ?, ?)',
-                    [id, monto, metodo, fecha_pago]
-                );
-                pagoRegistrado = true;
-                pagoId = pagoResult.insertId;
-            }
-        }
-
-        res.json({ mensaje: 'Estado de la cita actualizado correctamente', estado, pagoRegistrado, pagoId });
+        // Nota: el registro de pago en efectivo lo hace el admin manualmente desde POST /admin/pagos
+        res.json({ mensaje: 'Estado de la cita actualizado correctamente', estado });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al actualizar estado de la cita.' });
@@ -606,72 +617,166 @@ app.delete('/citas/:id', async (req, res) => {
     }
 });
 
-// Verificar disponibilidad de horario (GET /citas/disponibilidad/:fecha_hora)
+// Verificar disponibilidad de horario (GET /citas/disponibilidad/:fecha_hora?id_servicio=X)
+// id_servicio es opcional: si se provee, usa la duración del servicio para detectar solapamientos
 app.get('/citas/disponibilidad/:fecha_hora', async (req, res) => {
     try {
         const { fecha_hora } = req.params;
-        const [existing] = await pool.promise().query(
-            'SELECT id FROM citas WHERE fecha_hora = ? AND estado != ?',
-            [fecha_hora, 'cancelada']
-        );
+        const { id_servicio } = req.query;
+
+        let duracionNueva = 0;
+        if (id_servicio) {
+            const [servicioRows] = await pool.promise().query(
+                'SELECT duracion FROM servicios WHERE id = ?',
+                [parseInt(id_servicio)]
+            );
+            if (servicioRows.length === 0) {
+                return res.status(404).json({ error: 'Servicio no encontrado.' });
+            }
+            duracionNueva = servicioRows[0].duracion || 0;
+        }
+
+        // Verificar solapamiento considerando duración
+        const [existing] = await pool.promise().query(`
+            SELECT c.id FROM citas c
+            INNER JOIN servicios s ON c.id_servicio = s.id
+            WHERE c.estado != 'cancelada'
+            AND ? < DATE_ADD(c.fecha_hora, INTERVAL COALESCE(s.duracion, 0) MINUTE)
+            AND DATE_ADD(?, INTERVAL ? MINUTE) > c.fecha_hora
+        `, [fecha_hora, fecha_hora, duracionNueva]);
+
         const disponible = existing.length === 0;
-        res.status(200).json({ disponible, mensaje: disponible ? 'Horario disponible' : 'Horario ocupado' });
+        res.status(200).json({
+            disponible,
+            mensaje: disponible ? 'Horario disponible' : 'Horario ocupado',
+            duracion_minutos: duracionNueva || null
+        });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al verificar disponibilidad.' });
     }
 });
 
-// ==================== PAGOS CRUD ====================
+// ==================== PAGOS ====================
+/*
+  ⚠️  SQL MIGRATION - Ejecuta esto en tu base de datos MySQL ANTES de iniciar el servidor:
 
-// Registrar pago (POST /pagos)
+  ALTER TABLE pagos
+    CHANGE COLUMN fecha_pago fecha DATETIME NOT NULL,
+    ADD COLUMN id_usuario INT NULL AFTER id_cita,
+    ADD COLUMN estado ENUM('pendiente','aprobado','rechazado') DEFAULT 'pendiente' AFTER metodo,
+    ADD COLUMN comprobante VARCHAR(500) NULL AFTER estado,
+    ADD COLUMN referencia VARCHAR(255) NULL AFTER comprobante;
+
+  -- Rellenar id_usuario de pagos existentes
+  UPDATE pagos p INNER JOIN citas c ON p.id_cita = c.id SET p.id_usuario = c.id_usuario WHERE p.id_usuario IS NULL;
+
+  -- Marcar pagos existentes de citas completadas como aprobados
+  UPDATE pagos p INNER JOIN citas c ON p.id_cita = c.id SET p.estado = 'aprobado' WHERE c.estado = 'completada';
+*/
+
+// ── CLIENTE: Registrar pago (POST /pagos) ──
+// Solo para transferencia o tarjeta. El efectivo lo registra el admin.
 app.post('/pagos', async (req, res) => {
     try {
-        const { id_cita, monto, metodo, fecha_pago } = req.body;
-        if (!id_cita || !monto || !metodo || !fecha_pago) {
-            return res.status(400).json({ error: 'Faltan datos obligatorios.' });
+        const { id_cita, id_usuario, metodo, comprobante, referencia } = req.body;
+        if (!id_cita || !id_usuario || !metodo) {
+            return res.status(400).json({ error: 'Faltan datos obligatorios: id_cita, id_usuario, metodo.' });
         }
-        await pool.promise().query(
-            'INSERT INTO pagos (id_cita, monto, metodo, fecha_pago) VALUES (?, ?, ?, ?)',
-            [id_cita, monto, metodo, fecha_pago]
+        const metodosValidos = ['transferencia', 'tarjeta'];
+        if (!metodosValidos.includes(metodo)) {
+            return res.status(400).json({ error: 'Solo puedes registrar pagos por transferencia o tarjeta. El efectivo lo registra el administrador.' });
+        }
+        // Verificar que la cita existe y pertenece al usuario
+        const [citaRows] = await pool.promise().query(
+            'SELECT c.id, c.estado, s.precio FROM citas c INNER JOIN servicios s ON c.id_servicio = s.id WHERE c.id = ? AND c.id_usuario = ?',
+            [id_cita, id_usuario]
         );
-        res.json({ mensaje: 'Pago registrado exitosamente' });
+        if (citaRows.length === 0) {
+            return res.status(404).json({ error: 'Cita no encontrada o no pertenece al usuario.' });
+        }
+        if (citaRows[0].estado === 'cancelada') {
+            return res.status(400).json({ error: 'No se puede registrar pago para una cita cancelada.' });
+        }
+        // Verificar que no existe un pago pendiente o aprobado para esta cita
+        const [pagoExistente] = await pool.promise().query(
+            "SELECT id FROM pagos WHERE id_cita = ? AND estado IN ('pendiente','aprobado')",
+            [id_cita]
+        );
+        if (pagoExistente.length > 0) {
+            return res.status(409).json({ error: 'Ya existe un pago registrado para esta cita.' });
+        }
+        const monto = citaRows[0].precio;
+        const fecha = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        const [result] = await pool.promise().query(
+            "INSERT INTO pagos (id_cita, id_usuario, monto, metodo, estado, comprobante, referencia, fecha) VALUES (?, ?, ?, ?, 'pendiente', ?, ?, ?)",
+            [id_cita, id_usuario, monto, metodo, comprobante || null, referencia || null, fecha]
+        );
+        res.status(201).json({
+            mensaje: 'Pago registrado exitosamente. Pendiente de aprobación por el administrador.',
+            id_pago: result.insertId
+        });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al registrar pago.' });
     }
 });
 
-// Listar todos los pagos (GET /pagos)
-app.get('/pagos', async (req, res) => {
+// ── CLIENTE: Ver mis pagos (GET /mis-pagos?id_usuario=X) ──
+app.get('/mis-pagos', async (req, res) => {
     try {
         const { id_usuario } = req.query;
-
-        let query = `
-            SELECT 
-                pagos.id,
-                pagos.id_cita,
-                pagos.monto,
-                pagos.metodo,
-                pagos.fecha_pago,
-                citas.id_usuario,
-                servicios.nombre AS nombre_servicio,
-                usuarios.nombre AS nombre_cliente
-            FROM pagos
-            INNER JOIN citas ON pagos.id_cita = citas.id
-            INNER JOIN servicios ON citas.id_servicio = servicios.id
-            INNER JOIN usuarios ON citas.id_usuario = usuarios.id
-        `;
-
-        let params = [];
-
-        if (id_usuario) {
-            query += ' WHERE citas.id_usuario = ?';
-            params.push(parseInt(id_usuario));
+        if (!id_usuario) {
+            return res.status(400).json({ error: 'ID de usuario requerido.' });
         }
+        const [rows] = await pool.promise().query(`
+            SELECT
+                p.id, p.id_cita, p.id_usuario, p.monto, p.metodo, p.estado,
+                DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+                p.comprobante, p.referencia,
+                s.nombre AS nombre_servicio,
+                DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
+                c.estado AS estado_cita
+            FROM pagos p
+            INNER JOIN citas c ON p.id_cita = c.id
+            INNER JOIN servicios s ON c.id_servicio = s.id
+            WHERE p.id_usuario = ?
+            ORDER BY p.fecha DESC
+        `, [parseInt(id_usuario)]);
+        res.status(200).json({ pagos: rows });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar tus pagos.' });
+    }
+});
 
-        query += ' ORDER BY pagos.fecha_pago DESC';
-
+// ── ADMIN: Listar todos los pagos con filtros (GET /pagos) ──
+app.get('/pagos', async (req, res) => {
+    try {
+        const { estado, metodo, id_usuario, fecha_desde, fecha_hasta } = req.query;
+        let query = `
+            SELECT
+                p.id, p.id_cita, p.id_usuario, p.monto, p.metodo, p.estado,
+                DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+                p.comprobante, p.referencia,
+                u.nombre AS nombre_cliente, u.email AS email_cliente,
+                s.nombre AS nombre_servicio,
+                DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
+                c.estado AS estado_cita
+            FROM pagos p
+            INNER JOIN citas c ON p.id_cita = c.id
+            INNER JOIN servicios s ON c.id_servicio = s.id
+            INNER JOIN usuarios u ON p.id_usuario = u.id
+        `;
+        const conditions = [];
+        const params = [];
+        if (estado) { conditions.push('p.estado = ?'); params.push(estado); }
+        if (metodo) { conditions.push('p.metodo = ?'); params.push(metodo); }
+        if (id_usuario) { conditions.push('p.id_usuario = ?'); params.push(parseInt(id_usuario)); }
+        if (fecha_desde) { conditions.push('DATE(p.fecha) >= ?'); params.push(fecha_desde); }
+        if (fecha_hasta) { conditions.push('DATE(p.fecha) <= ?'); params.push(fecha_hasta); }
+        if (conditions.length > 0) query += ' WHERE ' + conditions.join(' AND ');
+        query += ' ORDER BY p.fecha DESC';
         const [rows] = await pool.promise().query(query, params);
         res.status(200).json({ pagos: rows });
     } catch (error) {
@@ -680,11 +785,25 @@ app.get('/pagos', async (req, res) => {
     }
 });
 
-// Ver pago por id (GET /pagos/:id)
+// ── ADMIN/CLIENTE: Ver pago por id (GET /pagos/:id) ──
 app.get('/pagos/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const [rows] = await pool.promise().query('SELECT * FROM pagos WHERE id = ?', [id]);
+        const [rows] = await pool.promise().query(`
+            SELECT
+                p.id, p.id_cita, p.id_usuario, p.monto, p.metodo, p.estado,
+                DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+                p.comprobante, p.referencia,
+                u.nombre AS nombre_cliente, u.email AS email_cliente,
+                s.nombre AS nombre_servicio,
+                DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
+                c.estado AS estado_cita
+            FROM pagos p
+            INNER JOIN citas c ON p.id_cita = c.id
+            INNER JOIN servicios s ON c.id_servicio = s.id
+            INNER JOIN usuarios u ON p.id_usuario = u.id
+            WHERE p.id = ?
+        `, [id]);
         if (rows.length === 0) {
             return res.status(404).json({ error: 'Pago no encontrado.' });
         }
@@ -695,11 +814,168 @@ app.get('/pagos/:id', async (req, res) => {
     }
 });
 
+// ── ADMIN: Aprobar pago (PUT /pagos/:id/aprobar) ──
+// Aprueba el pago y marca la cita como completada automáticamente
+app.put('/pagos/:id/aprobar', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const [pagoRows] = await pool.promise().query('SELECT * FROM pagos WHERE id = ?', [id]);
+        if (pagoRows.length === 0) {
+            return res.status(404).json({ error: 'Pago no encontrado.' });
+        }
+        if (pagoRows[0].estado === 'aprobado') {
+            return res.status(400).json({ error: 'El pago ya fue aprobado.' });
+        }
+        await pool.promise().query("UPDATE pagos SET estado = 'aprobado' WHERE id = ?", [id]);
+        await pool.promise().query("UPDATE citas SET estado = 'completada' WHERE id = ?", [pagoRows[0].id_cita]);
+        res.json({ mensaje: 'Pago aprobado correctamente. Cita marcada como completada.' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al aprobar pago.' });
+    }
+});
+
+// ── ADMIN: Rechazar pago (PUT /pagos/:id/rechazar) ──
+app.put('/pagos/:id/rechazar', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { motivo } = req.body;
+        const [pagoRows] = await pool.promise().query('SELECT * FROM pagos WHERE id = ?', [id]);
+        if (pagoRows.length === 0) {
+            return res.status(404).json({ error: 'Pago no encontrado.' });
+        }
+        if (pagoRows[0].estado === 'rechazado') {
+            return res.status(400).json({ error: 'El pago ya fue rechazado.' });
+        }
+        await pool.promise().query("UPDATE pagos SET estado = 'rechazado' WHERE id = ?", [id]);
+        res.json({ mensaje: 'Pago rechazado correctamente.', motivo: motivo || null });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al rechazar pago.' });
+    }
+});
+
+// ── ADMIN: Registrar pago en efectivo (POST /admin/pagos) ──
+// El admin registra manualmente el pago cuando el cliente paga en efectivo en la barbería.
+// Funciona para citas en estado 'pendiente' o 'completada' sin pago aprobado.
+// Al registrar el pago, la cita se marca automáticamente como 'completada'.
+app.post('/admin/pagos', async (req, res) => {
+    try {
+        const { id_cita, id_usuario, notas } = req.body;
+        if (!id_cita || !id_usuario) {
+            return res.status(400).json({ error: 'Faltan datos obligatorios: id_cita, id_usuario.' });
+        }
+
+        // Obtener la cita con info del servicio y del cliente
+        const [citaRows] = await pool.promise().query(`
+            SELECT c.id, c.estado, c.id_usuario AS cliente_id,
+                   s.precio, s.nombre AS nombre_servicio,
+                   u.nombre AS nombre_cliente
+            FROM citas c
+            INNER JOIN servicios s ON c.id_servicio = s.id
+            INNER JOIN usuarios u ON c.id_usuario = u.id
+            WHERE c.id = ?
+        `, [id_cita]);
+
+        if (citaRows.length === 0) {
+            return res.status(404).json({ error: 'Cita no encontrada.' });
+        }
+
+        const cita = citaRows[0];
+
+        // Solo se puede cobrar si la cita está pendiente o completada (no cancelada)
+        if (cita.estado === 'cancelada') {
+            return res.status(400).json({ error: 'No se puede registrar pago para una cita cancelada.' });
+        }
+
+        // Verificar que no existe ya un pago aprobado para esta cita
+        const [pagoExistente] = await pool.promise().query(
+            "SELECT id FROM pagos WHERE id_cita = ? AND estado = 'aprobado'",
+            [id_cita]
+        );
+        if (pagoExistente.length > 0) {
+            return res.status(409).json({ error: 'Esta cita ya tiene un pago aprobado registrado.' });
+        }
+
+        const monto = cita.precio;
+        const fecha = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+        // Registrar el pago en efectivo como aprobado directamente
+        const [result] = await pool.promise().query(
+            "INSERT INTO pagos (id_cita, id_usuario, monto, metodo, estado, referencia, fecha) VALUES (?, ?, ?, 'efectivo', 'aprobado', ?, ?)",
+            [id_cita, cita.cliente_id, monto, notas || null, fecha]
+        );
+
+        // Marcar la cita como completada si aún estaba pendiente
+        if (cita.estado === 'pendiente') {
+            await pool.promise().query("UPDATE citas SET estado = 'completada' WHERE id = ?", [id_cita]);
+        }
+
+        res.status(201).json({
+            mensaje: `Pago en efectivo de $${monto} registrado para ${cita.nombre_cliente}. Cita marcada como completada.`,
+            id_pago: result.insertId,
+            monto,
+            nombre_cliente: cita.nombre_cliente,
+            nombre_servicio: cita.nombre_servicio,
+            fecha
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al registrar pago en efectivo.' });
+    }
+});
+
+// ── ADMIN: Reporte de ingresos (GET /reportes/ingresos) ──
+// Filtra por fecha_desde y fecha_hasta (query params opcionales)
+app.get('/reportes/ingresos', async (req, res) => {
+    try {
+        const { fecha_desde, fecha_hasta } = req.query;
+        let whereClause = "WHERE p.estado = 'aprobado'";
+        const params = [];
+        if (fecha_desde) { whereClause += ' AND DATE(p.fecha) >= ?'; params.push(fecha_desde); }
+        if (fecha_hasta) { whereClause += ' AND DATE(p.fecha) <= ?'; params.push(fecha_hasta); }
+
+        const [[{ totalIngresos }]] = await pool.promise().query(
+            `SELECT COALESCE(SUM(p.monto), 0) AS totalIngresos FROM pagos p ${whereClause}`, params
+        );
+        const [[{ totalPagos }]] = await pool.promise().query(
+            `SELECT COUNT(*) AS totalPagos FROM pagos p ${whereClause}`, params
+        );
+        const [porMetodo] = await pool.promise().query(
+            `SELECT p.metodo, COUNT(*) AS total, SUM(p.monto) AS monto FROM pagos p ${whereClause} GROUP BY p.metodo`, params
+        );
+        const [porMes] = await pool.promise().query(
+            `SELECT DATE_FORMAT(p.fecha, '%Y-%m') AS mes, COUNT(*) AS total, SUM(p.monto) AS monto
+             FROM pagos p ${whereClause} GROUP BY mes ORDER BY mes DESC LIMIT 12`, params
+        );
+        const [porDia] = await pool.promise().query(
+            `SELECT DATE(p.fecha) AS dia, COUNT(*) AS total, SUM(p.monto) AS monto
+             FROM pagos p ${whereClause} GROUP BY dia ORDER BY dia DESC LIMIT 30`, params
+        );
+        const [topServicios] = await pool.promise().query(
+            `SELECT s.nombre AS servicio, COUNT(*) AS total, SUM(p.monto) AS monto
+             FROM pagos p
+             INNER JOIN citas c ON p.id_cita = c.id
+             INNER JOIN servicios s ON c.id_servicio = s.id
+             ${whereClause} GROUP BY s.id ORDER BY monto DESC LIMIT 5`, params
+        );
+        res.json({ totalIngresos, totalPagos, porMetodo, porMes, porDia, topServicios });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al generar reporte de ingresos.' });
+    }
+});
+
 // Ver pagos de una cita (GET /pagos/cita/:id_cita)
 app.get('/pagos/cita/:id_cita', async (req, res) => {
     try {
         const { id_cita } = req.params;
-        const [rows] = await pool.promise().query('SELECT * FROM pagos WHERE id_cita = ?', [id_cita]);
+        const [rows] = await pool.promise().query(`
+            SELECT p.id, p.id_cita, p.id_usuario, p.monto, p.metodo, p.estado,
+                   DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+                   p.comprobante, p.referencia
+            FROM pagos p WHERE p.id_cita = ?
+        `, [id_cita]);
         res.status(200).json({ pagos: rows });
     } catch (error) {
         console.error(error);
@@ -848,53 +1124,46 @@ app.post('/dashboard/citas-por-mes', verificarRol('admin'), async (req, res) => 
 // Endpoint consolidado para estadísticas de pagos - Solo Admin
 app.post('/dashboard/pagos-stats', verificarRol('admin'), async (req, res) => {
     try {
-        // Total de pagos (solo de citas completadas)
-        const [totalPagosRows] = await pool.promise().query(`
-            SELECT COUNT(*) as total
-            FROM pagos
-            INNER JOIN citas ON pagos.id_cita = citas.id
-            WHERE citas.estado = 'completada'
-        `);
+        // Total de pagos aprobados
+        const [totalPagosRows] = await pool.promise().query(
+            "SELECT COUNT(*) as total FROM pagos WHERE estado = 'aprobado'"
+        );
         const totalPagos = totalPagosRows[0]?.total || 0;
 
-        // Total monto pagado (solo de citas completadas)
-        const [totalMontoRows] = await pool.promise().query(`
-            SELECT SUM(pagos.monto) as totalMonto
-            FROM pagos
-            INNER JOIN citas ON pagos.id_cita = citas.id
-            WHERE citas.estado = 'completada'
-        `);
+        // Total monto pagado (pagos aprobados)
+        const [totalMontoRows] = await pool.promise().query(
+            "SELECT SUM(monto) as totalMonto FROM pagos WHERE estado = 'aprobado'"
+        );
         const totalMontoPagado = totalMontoRows[0]?.totalMonto || 0;
 
-        // Pagos por método (solo de citas completadas)
-        const [pagosPorMetodoRows] = await pool.promise().query(`
-            SELECT pagos.metodo, COUNT(*) as total, SUM(pagos.monto) as montoTotal
-            FROM pagos
-            INNER JOIN citas ON pagos.id_cita = citas.id
-            WHERE citas.estado = 'completada'
-            GROUP BY pagos.metodo
-        `);
+        // Pagos pendientes de aprobación
+        const [[{ totalPendientes }]] = await pool.promise().query(
+            "SELECT COUNT(*) as totalPendientes FROM pagos WHERE estado = 'pendiente'"
+        );
+
+        // Pagos por método (solo aprobados)
+        const [pagosPorMetodoRows] = await pool.promise().query(
+            "SELECT metodo, COUNT(*) as total, SUM(monto) as montoTotal FROM pagos WHERE estado = 'aprobado' GROUP BY metodo"
+        );
         const pagosPorMetodo = pagosPorMetodoRows || [];
 
-        // Pagos por mes (solo de citas completadas)
+        // Pagos por mes (solo aprobados)
         const [pagosPorMesRows] = await pool.promise().query(`
-            SELECT DATE_FORMAT(pagos.fecha_pago, '%Y-%m') as mes, COUNT(*) as total, SUM(pagos.monto) as montoTotal
+            SELECT DATE_FORMAT(pagos.fecha, '%Y-%m') as mes, COUNT(*) as total, SUM(pagos.monto) as montoTotal
             FROM pagos
-            INNER JOIN citas ON pagos.id_cita = citas.id
-            WHERE citas.estado = 'completada'
-            GROUP BY DATE_FORMAT(pagos.fecha_pago, '%Y-%m')
+            WHERE pagos.estado = 'aprobado'
+            GROUP BY DATE_FORMAT(pagos.fecha, '%Y-%m')
             ORDER BY mes DESC
             LIMIT 12
         `);
         const pagosPorMes = pagosPorMesRows || [];
 
-        // Pagos por día (solo de citas completadas)
+        // Pagos por día (solo aprobados)
         const [pagosPorDiaRows] = await pool.promise().query(`
-            SELECT DATE(pagos.fecha_pago) as dia, COUNT(*) as total, SUM(pagos.monto) as montoTotal
+            SELECT DATE(pagos.fecha) as dia, COUNT(*) as total, SUM(pagos.monto) as montoTotal
             FROM pagos
-            INNER JOIN citas ON pagos.id_cita = citas.id
-            WHERE citas.estado = 'completada'
-            GROUP BY DATE(pagos.fecha_pago)
+            WHERE pagos.estado = 'aprobado'
+            GROUP BY DATE(pagos.fecha)
             ORDER BY dia DESC
             LIMIT 30
         `);
@@ -903,6 +1172,7 @@ app.post('/dashboard/pagos-stats', verificarRol('admin'), async (req, res) => {
         res.json({
             totalPagos,
             totalMontoPagado,
+            totalPendientes,
             pagosPorMetodo,
             pagosPorMes,
             pagosPorDia
@@ -964,12 +1234,19 @@ app.listen(port, () => {
 
 
 
-    // ==================== PAGOS CRUD ====================
+    // ==================== PAGOS ====================
     console.log('PAGOS 💸');
-    console.log('POST   /pagos   -> Registrar pago');
-    console.log('GET    /pagos   -> Listar todos los pagos');
-    console.log('GET    /pagos/:id   -> Ver pago por id');
-    console.log('GET    /pagos/cita/:id_cita   -> Ver pagos de una cita');
+    console.log('── CLIENTE ──');
+    console.log('POST   /pagos                  -> Registrar pago (transferencia/tarjeta)');
+    console.log('GET    /mis-pagos?id_usuario=X -> Ver mis pagos');
+    console.log('── ADMIN ──');
+    console.log('GET    /pagos                  -> Listar todos los pagos (filtros: estado, metodo, id_usuario, fecha_desde, fecha_hasta)');
+    console.log('GET    /pagos/:id              -> Ver pago por id');
+    console.log('GET    /pagos/cita/:id_cita    -> Ver pagos de una cita');
+    console.log('PUT    /pagos/:id/aprobar      -> Aprobar pago (marca cita como completada)');
+    console.log('PUT    /pagos/:id/rechazar     -> Rechazar pago');
+    console.log('POST   /admin/pagos            -> Registrar pago en efectivo de un cliente');
+    console.log('GET    /reportes/ingresos      -> Reporte de ingresos (filtros: fecha_desde, fecha_hasta)');
 });
 
 
