@@ -3,10 +3,51 @@ const express = require('express');
 const mysql = require('mysql2');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const app = express();
 app.use(cors());
 app.use(express.json());
+// Deshabilitar ETag globalmente para evitar respuestas 304 con datos desactualizados
+app.disable('etag');
+// Forzar no-cache en todas las respuestas de la API
+app.use((req, res, next) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    next();
+});
 const port = process.env.PORT || 3000;
+
+// ==================== CONFIGURACIÓN DE ARCHIVOS (COMPROBANTES) ====================
+// Carpeta donde se guardan los comprobantes de pago
+const UPLOADS_DIR = path.join(__dirname, 'uploads', 'comprobantes');
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+// Servir comprobantes públicamente en /uploads/comprobantes/:archivo
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Configuración de Multer: guarda el archivo con nombre único
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        const nombre = `comprobante_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`;
+        cb(null, nombre);
+    }
+});
+const fileFilter = (req, file, cb) => {
+    const permitidos = ['.jpg', '.jpeg', '.png', '.pdf'];
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (permitidos.includes(ext)) return cb(null, true);
+    cb(new Error('Solo se permiten imágenes JPG, PNG o archivos PDF.'));
+};
+const upload = multer({
+    storage,
+    fileFilter,
+    limits: { fileSize: 5 * 1024 * 1024 } // 5 MB máx
+});
 
 // Configuración de la base de datos con variables de entorno
 const pool = mysql.createPool({
@@ -364,10 +405,10 @@ app.post('/citas', async (req, res) => {
             return res.status(400).json({ error: `Año inválido: ${year}. Debe tener 4 dígitos (ej: 2026).` });
         }
 
-        const estadosValidos = ['pendiente', 'completada', 'cancelada'];
-        const estadoInicial = 'pendiente';
+        const estadosValidos = ['confirmada', 'completada', 'cancelada'];
+        const estadoInicial = 'confirmada';
         if (!estadosValidos.includes(estadoInicial)) {
-            return res.status(400).json({ error: 'Estado no válido. Debe ser: pendiente, completada o cancelada.' });
+            return res.status(400).json({ error: 'Estado no válido. Debe ser: confirmada, completada o cancelada.' });
         }
 
         // Obtener el servicio (duracion en minutos y precio)
@@ -452,7 +493,7 @@ app.get('/citas', async (req, res) => {
             FROM citas c
             INNER JOIN usuarios u ON c.id_usuario = u.id
             INNER JOIN servicios s ON c.id_servicio = s.id
-            LEFT JOIN pagos p ON p.id_cita = c.id AND p.estado = 'aprobado'
+            LEFT JOIN pagos p ON p.id_cita = c.id AND p.estado != 'rechazado'
             ORDER BY c.fecha_hora DESC
         `);
         res.status(200).json({ citas: rows });
@@ -511,9 +552,9 @@ app.put('/citas/:id', async (req, res) => {
             }
         }
 
-        const estadosValidos = ['pendiente', 'completada', 'cancelada'];
+        const estadosValidos = ['confirmada', 'completada', 'cancelada'];
         if (estado && !estadosValidos.includes(estado)) {
-            return res.status(400).json({ error: 'Estado no válido. Debe ser: pendiente, completada o cancelada.' });
+            return res.status(400).json({ error: 'Estado no válido. Debe ser: confirmada, completada o cancelada.' });
         }
         // Obtener la duración del servicio (en minutos)
         const [servicioCheck] = await pool.promise().query(
@@ -558,9 +599,9 @@ app.patch('/citas/:id/estado', async (req, res) => {
             return res.status(400).json({ error: 'Debes enviar el estado.' });
         }
 
-        const estadosValidos = ['pendiente', 'completada', 'cancelada'];
+        const estadosValidos = ['confirmada', 'completada', 'cancelada'];
         if (!estadosValidos.includes(estado)) {
-            return res.status(400).json({ error: 'Estado no válido. Debe ser: pendiente, completada o cancelada.' });
+            return res.status(400).json({ error: 'Estado no válido. Debe ser: confirmada, completada o cancelada.' });
         }
 
         // Verificar que la cita existe y obtener info relevante
@@ -659,14 +700,18 @@ app.get('/citas/disponibilidad/:fecha_hora', async (req, res) => {
 
 // ==================== PAGOS ====================
 /*
-  ⚠️  SQL MIGRATION - Ejecuta esto en tu base de datos MySQL ANTES de iniciar el servidor:
+  ⚠️  SQL MIGRATION - Ejecuta esto en tu base de datos MySQL si aún no lo has hecho:
 
+  -- Estructura actual de la tabla pagos (confirma con DESCRIBE pagos):
   ALTER TABLE pagos
     CHANGE COLUMN fecha_pago fecha DATETIME NOT NULL,
     ADD COLUMN id_usuario INT NULL AFTER id_cita,
     ADD COLUMN estado ENUM('pendiente','aprobado','rechazado') DEFAULT 'pendiente' AFTER metodo,
-    ADD COLUMN comprobante VARCHAR(500) NULL AFTER estado,
-    ADD COLUMN referencia VARCHAR(255) NULL AFTER comprobante;
+    ADD COLUMN comprobante TEXT NULL AFTER estado,
+    ADD COLUMN referencia VARCHAR(500) NULL AFTER comprobante;
+
+  -- Si comprobante ya existe como VARCHAR(500), ampliar a TEXT para rutas largas:
+  ALTER TABLE pagos MODIFY COLUMN comprobante TEXT NULL;
 
   -- Rellenar id_usuario de pagos existentes
   UPDATE pagos p INNER JOIN citas c ON p.id_cita = c.id SET p.id_usuario = c.id_usuario WHERE p.id_usuario IS NULL;
@@ -675,48 +720,87 @@ app.get('/citas/disponibilidad/:fecha_hora', async (req, res) => {
   UPDATE pagos p INNER JOIN citas c ON p.id_cita = c.id SET p.estado = 'aprobado' WHERE c.estado = 'completada';
 */
 
-// ── CLIENTE: Registrar pago (POST /pagos) ──
-// Solo para transferencia o tarjeta. El efectivo lo registra el admin.
-app.post('/pagos', async (req, res) => {
+// ── CLIENTE: Registrar pago con comprobante (POST /pagos) ──
+// Solo transferencia o tarjeta. El comprobante es OBLIGATORIO.
+// Enviar como multipart/form-data: id_cita, id_usuario, metodo, referencia (opcional), comprobante (archivo)
+app.post('/pagos', upload.single('comprobante'), async (req, res) => {
+    // Si multer rechazó el archivo, el error llega aquí
     try {
-        const { id_cita, id_usuario, metodo, comprobante, referencia } = req.body;
+        const { id_cita, id_usuario, metodo, referencia } = req.body;
+
         if (!id_cita || !id_usuario || !metodo) {
+            if (req.file) fs.unlinkSync(req.file.path);
             return res.status(400).json({ error: 'Faltan datos obligatorios: id_cita, id_usuario, metodo.' });
         }
+
         const metodosValidos = ['transferencia', 'tarjeta'];
         if (!metodosValidos.includes(metodo)) {
+            if (req.file) fs.unlinkSync(req.file.path);
             return res.status(400).json({ error: 'Solo puedes registrar pagos por transferencia o tarjeta. El efectivo lo registra el administrador.' });
         }
+
+        // Comprobante obligatorio para transferencia y tarjeta
+        if (!req.file) {
+            return res.status(400).json({ error: 'Debes adjuntar el comprobante de pago (imagen JPG/PNG o PDF, máx. 5 MB).' });
+        }
+
         // Verificar que la cita existe y pertenece al usuario
         const [citaRows] = await pool.promise().query(
-            'SELECT c.id, c.estado, s.precio FROM citas c INNER JOIN servicios s ON c.id_servicio = s.id WHERE c.id = ? AND c.id_usuario = ?',
+            `SELECT c.id, c.estado, s.precio, s.nombre AS nombre_servicio
+             FROM citas c
+             INNER JOIN servicios s ON c.id_servicio = s.id
+             WHERE c.id = ? AND c.id_usuario = ?`,
             [id_cita, id_usuario]
         );
         if (citaRows.length === 0) {
+            fs.unlinkSync(req.file.path);
             return res.status(404).json({ error: 'Cita no encontrada o no pertenece al usuario.' });
         }
         if (citaRows[0].estado === 'cancelada') {
+            fs.unlinkSync(req.file.path);
             return res.status(400).json({ error: 'No se puede registrar pago para una cita cancelada.' });
         }
-        // Verificar que no existe un pago pendiente o aprobado para esta cita
+        if (citaRows[0].estado === 'completada') {
+            fs.unlinkSync(req.file.path);
+            return res.status(400).json({ error: 'Esta cita ya fue completada y pagada.' });
+        }
+
+        // Verificar que no exista ya un pago pendiente o aprobado para esta cita
         const [pagoExistente] = await pool.promise().query(
-            "SELECT id FROM pagos WHERE id_cita = ? AND estado IN ('pendiente','aprobado')",
+            "SELECT id, estado FROM pagos WHERE id_cita = ? AND estado IN ('pendiente','aprobado')",
             [id_cita]
         );
         if (pagoExistente.length > 0) {
-            return res.status(409).json({ error: 'Ya existe un pago registrado para esta cita.' });
+            fs.unlinkSync(req.file.path);
+            const estadoActual = pagoExistente[0].estado;
+            return res.status(409).json({
+                error: estadoActual === 'aprobado'
+                    ? 'Esta cita ya tiene un pago aprobado.'
+                    : 'Ya enviaste un comprobante para esta cita. Espera la aprobación del administrador.'
+            });
         }
+
         const monto = citaRows[0].precio;
         const fecha = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        // Guardar ruta relativa del comprobante (accesible vía /uploads/comprobantes/:archivo)
+        const urlComprobante = `/uploads/comprobantes/${req.file.filename}`;
+
         const [result] = await pool.promise().query(
             "INSERT INTO pagos (id_cita, id_usuario, monto, metodo, estado, comprobante, referencia, fecha) VALUES (?, ?, ?, ?, 'pendiente', ?, ?, ?)",
-            [id_cita, id_usuario, monto, metodo, comprobante || null, referencia || null, fecha]
+            [id_cita, id_usuario, monto, metodo, urlComprobante, referencia || null, fecha]
         );
+
         res.status(201).json({
-            mensaje: 'Pago registrado exitosamente. Pendiente de aprobación por el administrador.',
-            id_pago: result.insertId
+            mensaje: 'Comprobante enviado correctamente. El administrador revisará y confirmará tu pago.',
+            id_pago: result.insertId,
+            monto,
+            nombre_servicio: citaRows[0].nombre_servicio,
+            comprobante: urlComprobante,
+            comprobante_url: `${req.protocol}://${req.get('host')}${urlComprobante}`,
+            estado: 'pendiente'
         });
     } catch (error) {
+        if (req.file) fs.unlinkSync(req.file.path);
         console.error(error);
         res.status(500).json({ error: 'Error al registrar pago.' });
     }
@@ -750,6 +834,39 @@ app.get('/mis-pagos', async (req, res) => {
     }
 });
 
+// ── ADMIN: Pagos pendientes de revisión (GET /pagos/pendientes) ──
+// Devuelve solo los pagos con comprobante enviado y estado 'pendiente'
+app.get('/pagos/pendientes', async (req, res) => {
+    try {
+        const [rows] = await pool.promise().query(`
+            SELECT
+                p.id, p.id_cita, p.id_usuario, p.monto, p.metodo, p.estado,
+                DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+                p.comprobante, p.referencia,
+                u.nombre AS nombre_cliente, u.email AS email_cliente, u.telefono AS telefono_cliente,
+                s.nombre AS nombre_servicio, s.precio,
+                DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
+                c.estado AS estado_cita
+            FROM pagos p
+            LEFT JOIN citas c ON p.id_cita = c.id
+            LEFT JOIN servicios s ON c.id_servicio = s.id
+            LEFT JOIN usuarios u ON p.id_usuario = u.id
+            WHERE p.estado = 'pendiente'
+              AND p.comprobante IS NOT NULL
+            ORDER BY p.fecha ASC
+        `);
+        const base = `${req.protocol}://${req.get('host')}`;
+        const pendientesConUrl = rows.map(r => ({
+            ...r,
+            comprobante_url: r.comprobante ? `${base}${r.comprobante}` : null
+        }));
+        res.status(200).json({ pendientes: pendientesConUrl, total: pendientesConUrl.length });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar pagos pendientes.' });
+    }
+});
+
 // ── ADMIN: Listar todos los pagos con filtros (GET /pagos) ──
 app.get('/pagos', async (req, res) => {
     try {
@@ -766,7 +883,7 @@ app.get('/pagos', async (req, res) => {
             FROM pagos p
             INNER JOIN citas c ON p.id_cita = c.id
             INNER JOIN servicios s ON c.id_servicio = s.id
-            INNER JOIN usuarios u ON p.id_usuario = u.id
+            LEFT JOIN usuarios u ON p.id_usuario = u.id
         `;
         const conditions = [];
         const params = [];
@@ -778,7 +895,12 @@ app.get('/pagos', async (req, res) => {
         if (conditions.length > 0) query += ' WHERE ' + conditions.join(' AND ');
         query += ' ORDER BY p.fecha DESC';
         const [rows] = await pool.promise().query(query, params);
-        res.status(200).json({ pagos: rows });
+        const base = `${req.protocol}://${req.get('host')}`;
+        const pagosConUrl = rows.map(r => ({
+            ...r,
+            comprobante_url: r.comprobante ? `${base}${r.comprobante}` : null
+        }));
+        res.status(200).json({ pagos: pagosConUrl });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al consultar pagos.' });
@@ -794,20 +916,28 @@ app.get('/pagos/:id', async (req, res) => {
                 p.id, p.id_cita, p.id_usuario, p.monto, p.metodo, p.estado,
                 DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
                 p.comprobante, p.referencia,
-                u.nombre AS nombre_cliente, u.email AS email_cliente,
-                s.nombre AS nombre_servicio,
+                u.nombre AS nombre_cliente, u.email AS email_cliente, u.telefono AS telefono_cliente,
+                s.nombre AS nombre_servicio, s.precio,
                 DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
+                c.notas AS notas_cita,
                 c.estado AS estado_cita
             FROM pagos p
             INNER JOIN citas c ON p.id_cita = c.id
             INNER JOIN servicios s ON c.id_servicio = s.id
-            INNER JOIN usuarios u ON p.id_usuario = u.id
+            LEFT JOIN usuarios u ON p.id_usuario = u.id
             WHERE p.id = ?
         `, [id]);
         if (rows.length === 0) {
             return res.status(404).json({ error: 'Pago no encontrado.' });
         }
-        res.status(200).json({ pago: rows[0] });
+        const pago = rows[0];
+        const base = `${req.protocol}://${req.get('host')}`;
+        res.status(200).json({
+            pago: {
+                ...pago,
+                comprobante_url: pago.comprobante ? `${base}${pago.comprobante}` : null
+            }
+        });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al consultar pago.' });
@@ -815,20 +945,37 @@ app.get('/pagos/:id', async (req, res) => {
 });
 
 // ── ADMIN: Aprobar pago (PUT /pagos/:id/aprobar) ──
-// Aprueba el pago y marca la cita como completada automáticamente
+// Aprueba el comprobante de pago y marca la cita como completada
 app.put('/pagos/:id/aprobar', async (req, res) => {
     try {
         const { id } = req.params;
-        const [pagoRows] = await pool.promise().query('SELECT * FROM pagos WHERE id = ?', [id]);
+        const [pagoRows] = await pool.promise().query(`
+            SELECT p.*, u.nombre AS nombre_cliente, s.nombre AS nombre_servicio
+            FROM pagos p
+            LEFT JOIN usuarios u ON p.id_usuario = u.id
+            LEFT JOIN citas c ON p.id_cita = c.id
+            LEFT JOIN servicios s ON c.id_servicio = s.id
+            WHERE p.id = ?
+        `, [id]);
         if (pagoRows.length === 0) {
             return res.status(404).json({ error: 'Pago no encontrado.' });
         }
-        if (pagoRows[0].estado === 'aprobado') {
-            return res.status(400).json({ error: 'El pago ya fue aprobado.' });
+        const pago = pagoRows[0];
+        if (pago.estado === 'aprobado') {
+            return res.status(400).json({ error: 'Este pago ya fue aprobado anteriormente.' });
+        }
+        if (pago.estado === 'rechazado') {
+            return res.status(400).json({ error: 'No se puede aprobar un pago que fue rechazado.' });
         }
         await pool.promise().query("UPDATE pagos SET estado = 'aprobado' WHERE id = ?", [id]);
-        await pool.promise().query("UPDATE citas SET estado = 'completada' WHERE id = ?", [pagoRows[0].id_cita]);
-        res.json({ mensaje: 'Pago aprobado correctamente. Cita marcada como completada.' });
+        await pool.promise().query("UPDATE citas SET estado = 'completada' WHERE id = ?", [pago.id_cita]);
+        res.json({
+            mensaje: 'Pago aprobado correctamente. Cita marcada como completada.',
+            nombre_cliente: pago.nombre_cliente,
+            nombre_servicio: pago.nombre_servicio,
+            monto: pago.monto,
+            metodo: pago.metodo
+        });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al aprobar pago.' });
@@ -836,19 +983,34 @@ app.put('/pagos/:id/aprobar', async (req, res) => {
 });
 
 // ── ADMIN: Rechazar pago (PUT /pagos/:id/rechazar) ──
+// El motivo se almacena en el campo 'referencia' del pago
 app.put('/pagos/:id/rechazar', async (req, res) => {
     try {
         const { id } = req.params;
         const { motivo } = req.body;
+        if (!motivo || motivo.trim() === '') {
+            return res.status(400).json({ error: 'Debes indicar el motivo del rechazo para notificar al cliente.' });
+        }
         const [pagoRows] = await pool.promise().query('SELECT * FROM pagos WHERE id = ?', [id]);
         if (pagoRows.length === 0) {
             return res.status(404).json({ error: 'Pago no encontrado.' });
         }
         if (pagoRows[0].estado === 'rechazado') {
-            return res.status(400).json({ error: 'El pago ya fue rechazado.' });
+            return res.status(400).json({ error: 'El pago ya fue rechazado anteriormente.' });
         }
-        await pool.promise().query("UPDATE pagos SET estado = 'rechazado' WHERE id = ?", [id]);
-        res.json({ mensaje: 'Pago rechazado correctamente.', motivo: motivo || null });
+        if (pagoRows[0].estado === 'aprobado') {
+            return res.status(400).json({ error: 'No se puede rechazar un pago que ya fue aprobado.' });
+        }
+        // Guardar motivo en campo referencia prefijado
+        const motivoGuardado = `RECHAZO: ${motivo.trim()}`;
+        await pool.promise().query(
+            "UPDATE pagos SET estado = 'rechazado', referencia = ? WHERE id = ?",
+            [motivoGuardado, id]
+        );
+        res.json({
+            mensaje: 'Pago rechazado. El cliente deberá enviar un nuevo comprobante.',
+            motivo: motivo.trim()
+        });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al rechazar pago.' });
@@ -856,21 +1018,29 @@ app.put('/pagos/:id/rechazar', async (req, res) => {
 });
 
 // ── ADMIN: Registrar pago en efectivo (POST /admin/pagos) ──
-// El admin registra manualmente el pago cuando el cliente paga en efectivo en la barbería.
-// Funciona para citas en estado 'pendiente' o 'completada' sin pago aprobado.
-// Al registrar el pago, la cita se marca automáticamente como 'completada'.
+// El admin registra manualmente cuando el cliente paga en efectivo en la barbería.
+// El pago se aprueba directamente (no requiere comprobante).
+// Acepta: id_cita, id_usuario (del admin), notas (opcional), monto_personalizado (opcional para descuentos/extras)
 app.post('/admin/pagos', async (req, res) => {
     try {
-        const { id_cita, id_usuario, notas } = req.body;
+        const { id_cita, id_usuario, notas, monto_personalizado } = req.body;
         if (!id_cita || !id_usuario) {
             return res.status(400).json({ error: 'Faltan datos obligatorios: id_cita, id_usuario.' });
         }
 
-        // Obtener la cita con info del servicio y del cliente
+        // Verificar que quien registra es admin
+        const [adminCheck] = await pool.promise().query(
+            'SELECT rol FROM usuarios WHERE id = ?', [id_usuario]
+        );
+        if (adminCheck.length === 0 || adminCheck[0].rol !== 'admin') {
+            return res.status(403).json({ error: 'Solo un administrador puede registrar pagos en efectivo.' });
+        }
+
+        // Obtener la cita con info completa del servicio y del cliente
         const [citaRows] = await pool.promise().query(`
             SELECT c.id, c.estado, c.id_usuario AS cliente_id,
                    s.precio, s.nombre AS nombre_servicio,
-                   u.nombre AS nombre_cliente
+                   u.nombre AS nombre_cliente, u.email AS email_cliente, u.telefono AS telefono_cliente
             FROM citas c
             INNER JOIN servicios s ON c.id_servicio = s.id
             INNER JOIN usuarios u ON c.id_usuario = u.id
@@ -883,12 +1053,14 @@ app.post('/admin/pagos', async (req, res) => {
 
         const cita = citaRows[0];
 
-        // Solo se puede cobrar si la cita está pendiente o completada (no cancelada)
         if (cita.estado === 'cancelada') {
             return res.status(400).json({ error: 'No se puede registrar pago para una cita cancelada.' });
         }
+        if (cita.estado === 'completada') {
+            return res.status(400).json({ error: 'Esta cita ya fue completada y no requiere registro adicional de pago.' });
+        }
 
-        // Verificar que no existe ya un pago aprobado para esta cita
+        // Verificar que no existe ya un pago aprobado
         const [pagoExistente] = await pool.promise().query(
             "SELECT id FROM pagos WHERE id_cita = ? AND estado = 'aprobado'",
             [id_cita]
@@ -897,26 +1069,48 @@ app.post('/admin/pagos', async (req, res) => {
             return res.status(409).json({ error: 'Esta cita ya tiene un pago aprobado registrado.' });
         }
 
-        const monto = cita.precio;
+        // Si hay un pago pendiente (comprobante enviado por el cliente), cancelarlo
+        // porque ahora pagó en efectivo presencialmente
+        const [pagoPendiente] = await pool.promise().query(
+            "SELECT id FROM pagos WHERE id_cita = ? AND estado = 'pendiente'",
+            [id_cita]
+        );
+        if (pagoPendiente.length > 0) {
+            await pool.promise().query(
+                "UPDATE pagos SET estado = 'rechazado', referencia = 'RECHAZO: Reemplazado por pago en efectivo presencial.' WHERE id = ?",
+                [pagoPendiente[0].id]
+            );
+        }
+
+        // Validar monto personalizado si se proporciona
+        let monto = cita.precio;
+        if (monto_personalizado !== undefined && monto_personalizado !== null && monto_personalizado !== '') {
+            const montoNum = parseFloat(monto_personalizado);
+            if (isNaN(montoNum) || montoNum <= 0) {
+                return res.status(400).json({ error: 'El monto personalizado debe ser un número positivo.' });
+            }
+            monto = montoNum;
+        }
+
         const fecha = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
-        // Registrar el pago en efectivo como aprobado directamente
         const [result] = await pool.promise().query(
             "INSERT INTO pagos (id_cita, id_usuario, monto, metodo, estado, referencia, fecha) VALUES (?, ?, ?, 'efectivo', 'aprobado', ?, ?)",
             [id_cita, cita.cliente_id, monto, notas || null, fecha]
         );
 
-        // Marcar la cita como completada si aún estaba pendiente
-        if (cita.estado === 'pendiente') {
-            await pool.promise().query("UPDATE citas SET estado = 'completada' WHERE id = ?", [id_cita]);
-        }
+        // Marcar la cita como completada
+        await pool.promise().query("UPDATE citas SET estado = 'completada' WHERE id = ?", [id_cita]);
 
         res.status(201).json({
-            mensaje: `Pago en efectivo de $${monto} registrado para ${cita.nombre_cliente}. Cita marcada como completada.`,
+            mensaje: `Cobro en efectivo registrado correctamente.`,
             id_pago: result.insertId,
             monto,
+            precio_servicio: cita.precio,
             nombre_cliente: cita.nombre_cliente,
+            email_cliente: cita.email_cliente,
             nombre_servicio: cita.nombre_servicio,
+            notas: notas || null,
             fecha
         });
     } catch (error) {
@@ -976,7 +1170,12 @@ app.get('/pagos/cita/:id_cita', async (req, res) => {
                    p.comprobante, p.referencia
             FROM pagos p WHERE p.id_cita = ?
         `, [id_cita]);
-        res.status(200).json({ pagos: rows });
+        const base = `${req.protocol}://${req.get('host')}`;
+        const pagosConUrl = rows.map(r => ({
+            ...r,
+            comprobante_url: r.comprobante ? `${base}${r.comprobante}` : null
+        }));
+        res.status(200).json({ pagos: pagosConUrl });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al consultar pagos de la cita.' });
@@ -1237,16 +1436,18 @@ app.listen(port, () => {
     // ==================== PAGOS ====================
     console.log('PAGOS 💸');
     console.log('── CLIENTE ──');
-    console.log('POST   /pagos                  -> Registrar pago (transferencia/tarjeta)');
+    console.log('POST   /pagos                  -> Registrar pago con comprobante (multipart/form-data: transferencia/tarjeta)');
     console.log('GET    /mis-pagos?id_usuario=X -> Ver mis pagos');
     console.log('── ADMIN ──');
     console.log('GET    /pagos                  -> Listar todos los pagos (filtros: estado, metodo, id_usuario, fecha_desde, fecha_hasta)');
+    console.log('GET    /pagos/pendientes        -> Pagos pendientes de revisión (con comprobante)');
     console.log('GET    /pagos/:id              -> Ver pago por id');
     console.log('GET    /pagos/cita/:id_cita    -> Ver pagos de una cita');
-    console.log('PUT    /pagos/:id/aprobar      -> Aprobar pago (marca cita como completada)');
-    console.log('PUT    /pagos/:id/rechazar     -> Rechazar pago');
-    console.log('POST   /admin/pagos            -> Registrar pago en efectivo de un cliente');
+    console.log('PUT    /pagos/:id/aprobar      -> Aprobar comprobante (marca cita como completada)');
+    console.log('PUT    /pagos/:id/rechazar     -> Rechazar comprobante (requiere motivo)');
+    console.log('POST   /admin/pagos            -> Registrar cobro en efectivo (aprobado directo)');
     console.log('GET    /reportes/ingresos      -> Reporte de ingresos (filtros: fecha_desde, fecha_hasta)');
+    console.log('📁 Comprobantes disponibles en: /uploads/comprobantes/:archivo');
 });
 
 
