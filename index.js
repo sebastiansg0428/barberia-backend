@@ -6,6 +6,7 @@ const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const PDFDocument = require('pdfkit');
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -28,9 +29,15 @@ if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 // Servir comprobantes públicamente en /uploads/comprobantes/:archivo
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Configuración de Multer: guarda el archivo con nombre único
+// Configuración de Multer: guarda el archivo organizado por año/mes (mejora #6)
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+    destination: (req, file, cb) => {
+        const now = new Date();
+        const sub = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}`;
+        const dir = path.join(UPLOADS_DIR, sub);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        cb(null, dir);
+    },
     filename: (req, file, cb) => {
         const ext = path.extname(file.originalname).toLowerCase();
         const nombre = `comprobante_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`;
@@ -370,104 +377,89 @@ app.delete('/servicios/:id', async (req, res) => {
 
 // ==================== CITAS CRUD ====================
 
-// Crear cita (POST /citas) con opción de pago
+// POST /citas — Reservar cita + auto-crea pago PENDIENTE
+// Body JSON: { id_usuario, id_barbero?, servicios: [id1,id2,...], fecha_hora, notas? }
 app.post('/citas', async (req, res) => {
     const connection = await pool.promise().getConnection();
     try {
-        const { id_usuario, id_servicio, fecha_hora, notas, metodo_pago } = req.body;
-        if (!id_usuario || !id_servicio || !fecha_hora) {
-            return res.status(400).json({ error: 'Debes ingresar usuario, servicio y fecha/hora.' });
+        const { id_usuario, id_barbero, servicios, fecha_hora, notas } = req.body;
+
+        if (!id_usuario || !fecha_hora || !Array.isArray(servicios) || servicios.length === 0) {
+            connection.release();
+            return res.status(400).json({ error: 'Requeridos: id_usuario, servicios (array de IDs), fecha_hora.' });
         }
 
-        // Validar método de pago si se proporciona
-        if (metodo_pago) {
-            const metodosValidos = ['efectivo', 'transferencia', 'tarjeta'];
-            if (!metodosValidos.includes(metodo_pago)) {
-                return res.status(400).json({ error: 'Método de pago no válido. Debe ser: efectivo, transferencia o tarjeta.' });
-            }
-        }
-
-        // Validar formato de fecha
         const fechaRegex = /^\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}(:\d{2})?$/;
-        if (!fechaRegex.test(fecha_hora)) {
+        if (!fechaRegex.test(fecha_hora) || isNaN(new Date(fecha_hora).getTime())) {
+            connection.release();
             return res.status(400).json({ error: 'Formato de fecha inválido. Use: YYYY-MM-DD HH:mm:ss' });
         }
 
-        // Validar que la fecha sea válida
-        const fecha = new Date(fecha_hora);
-        if (isNaN(fecha.getTime())) {
-            return res.status(400).json({ error: 'Fecha inválida.' });
-        }
-
-        // Validar que el año tenga 4 dígitos
-        const year = fecha_hora.split(/[\sT-]/)[0];
-        if (year.length !== 4) {
-            return res.status(400).json({ error: `Año inválido: ${year}. Debe tener 4 dígitos (ej: 2026).` });
-        }
-
-        const estadosValidos = ['confirmada', 'completada', 'cancelada'];
-        const estadoInicial = 'confirmada';
-        if (!estadosValidos.includes(estadoInicial)) {
-            return res.status(400).json({ error: 'Estado no válido. Debe ser: confirmada, completada o cancelada.' });
-        }
-
-        // Obtener el servicio (duracion en minutos y precio)
-        const [servicioCheck] = await connection.query(
-            'SELECT duracion, precio FROM servicios WHERE id = ?',
-            [id_servicio]
+        // Obtener precio + duración de todos los servicios
+        const ids = [...new Set(servicios.map(Number).filter(n => !isNaN(n) && n > 0))];
+        const placeholders = ids.map(() => '?').join(',');
+        const [serviciosRows] = await connection.query(
+            `SELECT id, nombre, precio, duracion FROM servicios WHERE id IN (${placeholders})`, ids
         );
-        if (servicioCheck.length === 0) {
+        if (serviciosRows.length !== ids.length) {
             connection.release();
-            return res.status(404).json({ error: 'Servicio no encontrado.' });
+            return res.status(404).json({ error: 'Uno o más servicios no existen.' });
         }
-        const duracionNueva = servicioCheck[0].duracion || 0;
-        const precioServicio = servicioCheck[0].precio;
 
-        // Verificar solapamiento de horarios considerando la duración de cada servicio
-        // Conflicto si: nueva_inicio < existente_fin AND nueva_fin > existente_inicio
-        const [existing] = await connection.query(`
+        const totalDuracion = serviciosRows.reduce((s, r) => s + (r.duracion || 0), 0);
+        const subtotal = serviciosRows.reduce((s, r) => s + parseFloat(r.precio), 0);
+        const barberoId = id_barbero ? parseInt(id_barbero) : null;
+
+        // Verificar solapamiento (por barbero si se especifica)
+        const overlapBase = `
             SELECT c.id FROM citas c
+            LEFT JOIN (SELECT id_cita, SUM(duracion) AS dur FROM cita_servicios GROUP BY id_cita) cs ON cs.id_cita = c.id
             INNER JOIN servicios s ON c.id_servicio = s.id
-            WHERE c.estado != 'cancelada'
-            AND ? < DATE_ADD(c.fecha_hora, INTERVAL COALESCE(s.duracion, 0) MINUTE)
+            WHERE c.estado NOT IN ('cancelada')
+            AND ? < DATE_ADD(c.fecha_hora, INTERVAL COALESCE(cs.dur, s.duracion, 0) MINUTE)
             AND DATE_ADD(?, INTERVAL ? MINUTE) > c.fecha_hora
-        `, [fecha_hora, fecha_hora, duracionNueva]);
+        `;
+        const overlapParams = barberoId
+            ? [fecha_hora, fecha_hora, totalDuracion, barberoId]
+            : [fecha_hora, fecha_hora, totalDuracion];
+        const overlapSuffix = barberoId ? ' AND c.id_barbero = ?' : '';
+        const [existing] = await connection.query(overlapBase + overlapSuffix, overlapParams);
         if (existing.length > 0) {
             connection.release();
             return res.status(409).json({ error: 'El horario se solapa con otra cita existente.' });
         }
 
-        // Iniciar transacción
         await connection.beginTransaction();
 
-        // Crear la cita
+        // Cita en estado RESERVADA (pago aún pendiente)
         const [citaResult] = await connection.query(
-            'INSERT INTO citas (id_usuario, id_servicio, fecha_hora, estado, notas) VALUES (?, ?, ?, ?, ?)',
-            [id_usuario, id_servicio, fecha_hora, estadoInicial, notas || null]
+            'INSERT INTO citas (id_usuario, id_servicio, id_barbero, fecha_hora, estado, notas) VALUES (?, ?, ?, ?, "reservada", ?)',
+            [id_usuario, ids[0], barberoId, fecha_hora, notas || null]
         );
-
         const id_cita = citaResult.insertId;
 
-        // Si se proporcionó método de pago, crear el pago automáticamente
-        if (metodo_pago) {
-            const monto = precioServicio;
-            const fecha = new Date().toISOString().slice(0, 19).replace('T', ' ');
-
-            // Registrar el pago con estado 'pendiente' (admin debe aprobar)
+        // Registrar cada servicio en cita_servicios
+        for (const s of serviciosRows) {
             await connection.query(
-                "INSERT INTO pagos (id_cita, id_usuario, monto, metodo, estado, fecha) VALUES (?, ?, ?, ?, 'pendiente', ?)",
-                [id_cita, id_usuario, monto, metodo_pago, fecha]
+                'INSERT INTO cita_servicios (id_cita, id_servicio, nombre, precio, duracion) VALUES (?, ?, ?, ?, ?)',
+                [id_cita, s.id, s.nombre, s.precio, s.duracion || 0]
             );
         }
 
-        // Confirmar transacción
         await connection.commit();
         connection.release();
 
-        res.json({
-            mensaje: 'Cita creada exitosamente' + (metodo_pago ? ' y pago registrado' : ''),
+        res.status(201).json({
+            mensaje: 'Cita reservada. Para confirmarla, el cliente debe subir un comprobante de pago (POST /pagos) o el administrador registrar el cobro en efectivo (POST /admin/pagos).',
             id_cita,
-            pago_registrado: !!metodo_pago
+            estado_cita: 'reservada',
+            estado_pago: null,
+            metodo_pago: null,
+            servicios: serviciosRows.map(s => ({ id: s.id, nombre: s.nombre, precio: parseFloat(s.precio) })),
+            subtotal: parseFloat(subtotal.toFixed(2)),
+            total: parseFloat(subtotal.toFixed(2)),
+            duracion_total_minutos: totalDuracion,
+            fecha_hora
         });
     } catch (error) {
         await connection.rollback();
@@ -477,221 +469,284 @@ app.post('/citas', async (req, res) => {
     }
 });
 
-// Listar todas las citas (GET /citas)
-
+// GET /citas — listado con barbero, multi-servicios y pago activo
 app.get('/citas', async (req, res) => {
     try {
         const [rows] = await pool.promise().query(`
-            SELECT c.id, c.id_usuario, c.id_servicio,
-                   DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') as fecha_hora,
+            SELECT c.id, c.id_usuario, c.id_servicio, c.id_barbero,
+                   DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_hora,
                    c.estado, c.notas,
-                   u.nombre as nombre_usuario, u.email, u.telefono,
-                   s.nombre as nombre_servicio, s.precio, s.duracion,
-                   p.id AS id_pago,
-                   p.estado AS estado_pago,
-                   p.metodo AS metodo_pago
+                   u.nombre AS nombre_usuario, u.email, u.telefono,
+                   s.nombre AS nombre_servicio, s.precio, s.duracion,
+                   b.nombre AS nombre_barbero,
+                   (SELECT GROUP_CONCAT(
+                       JSON_OBJECT('id', cs.id_servicio, 'nombre', cs.nombre, 'precio', cs.precio, 'duracion', cs.duracion)
+                       SEPARATOR ','
+                    ) FROM cita_servicios cs WHERE cs.id_cita = c.id) AS servicios_raw,
+                   COALESCE(
+                       (SELECT SUM(cs.precio) FROM cita_servicios cs WHERE cs.id_cita = c.id),
+                       s.precio
+                   ) AS total_servicios,
+                   (
+                       SELECT id FROM pagos WHERE id_cita = c.id AND estado != 'rechazado' ORDER BY fecha DESC LIMIT 1
+                   ) AS id_pago,
+                   (
+                       SELECT monto FROM pagos WHERE id_cita = c.id AND estado != 'rechazado' ORDER BY fecha DESC LIMIT 1
+                   ) AS total_pago,
+                   (
+                       SELECT estado FROM pagos WHERE id_cita = c.id AND estado != 'rechazado' ORDER BY fecha DESC LIMIT 1
+                   ) AS estado_pago,
+                   (
+                       -- Retorna el metodo real; NULL si aun no hay pago registrado
+                       SELECT metodo
+                       FROM pagos WHERE id_cita = c.id AND estado != 'rechazado' ORDER BY fecha DESC LIMIT 1
+                   ) AS metodo_pago,
+                   (
+                       SELECT comprobante FROM pagos WHERE id_cita = c.id AND estado != 'rechazado' ORDER BY fecha DESC LIMIT 1
+                   ) AS comprobante,
+                   ROUND(
+                       COALESCE(
+                           (SELECT SUM(cs2.precio) FROM cita_servicios cs2 WHERE cs2.id_cita = c.id), s.precio
+                       ) - COALESCE(
+                           (SELECT SUM(p2.monto) FROM pagos p2 WHERE p2.id_cita = c.id AND p2.estado = 'completado'), 0
+                       )
+                   , 2) AS saldo_pendiente
             FROM citas c
             INNER JOIN usuarios u ON c.id_usuario = u.id
             INNER JOIN servicios s ON c.id_servicio = s.id
-            LEFT JOIN pagos p ON p.id_cita = c.id AND p.estado != 'rechazado'
-            ORDER BY c.fecha_hora DESC
+            LEFT JOIN  usuarios b ON c.id_barbero  = b.id
+            ORDER BY c.fecha_hora ASC
         `);
-        res.status(200).json({ citas: rows });
+        const citas = rows.map(r => ({
+            ...r,
+            servicios: r.servicios_raw
+                ? JSON.parse('[' + r.servicios_raw + ']')
+                : [{ id: r.id_servicio, nombre: r.nombre_servicio, precio: parseFloat(r.precio) }],
+            servicios_raw: undefined
+        }));
+        res.status(200).json({ citas });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al consultar citas.' });
     }
 });
 
-// Ver cita por id (GET /citas/:id)
+// GET /citas/:id — detalle con servicios, barbero y pago activo
 app.get('/citas/:id', async (req, res) => {
     try {
         const { id } = req.params;
         const [rows] = await pool.promise().query(`
-            SELECT c.id, c.id_usuario, c.id_servicio,
-                   DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') as fecha_hora,
+            SELECT c.id, c.id_usuario, c.id_servicio, c.id_barbero,
+                   DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_hora,
                    c.estado, c.notas,
-                   u.nombre as nombre_usuario, u.email, u.telefono,
-                   s.nombre as nombre_servicio, s.precio, s.duracion
+                   u.nombre AS nombre_usuario, u.email, u.telefono,
+                   s.nombre AS nombre_servicio, s.precio, s.duracion,
+                   b.nombre AS nombre_barbero,
+                   (
+                       SELECT id FROM pagos WHERE id_cita = c.id AND estado != 'rechazado' ORDER BY fecha DESC LIMIT 1
+                   ) AS id_pago,
+                   (
+                       SELECT monto FROM pagos WHERE id_cita = c.id AND estado != 'rechazado' ORDER BY fecha DESC LIMIT 1
+                   ) AS total_pago,
+                   (
+                       SELECT estado FROM pagos WHERE id_cita = c.id AND estado != 'rechazado' ORDER BY fecha DESC LIMIT 1
+                   ) AS estado_pago,
+                   (
+                       SELECT metodo FROM pagos WHERE id_cita = c.id AND estado != 'rechazado' ORDER BY fecha DESC LIMIT 1
+                   ) AS metodo_pago,
+                   (
+                       SELECT comprobante FROM pagos WHERE id_cita = c.id AND estado != 'rechazado' ORDER BY fecha DESC LIMIT 1
+                   ) AS comprobante,
+                   -- Mejora #10: saldo pendiente de pago
+                   ROUND(
+                       COALESCE(
+                           (SELECT SUM(cs2.precio) FROM cita_servicios cs2 WHERE cs2.id_cita = c.id), s.precio
+                       ) - COALESCE(
+                           (SELECT SUM(p2.monto) FROM pagos p2 WHERE p2.id_cita = c.id AND p2.estado = 'completado'), 0
+                       )
+                   , 2) AS saldo_pendiente
             FROM citas c
             INNER JOIN usuarios u ON c.id_usuario = u.id
             INNER JOIN servicios s ON c.id_servicio = s.id
+            LEFT JOIN  usuarios b ON c.id_barbero  = b.id
             WHERE c.id = ?
         `, [id]);
-        if (rows.length === 0) {
-            return res.status(404).json({ error: 'Cita no encontrada.' });
-        }
-        res.status(200).json({ cita: rows[0] });
+        if (rows.length === 0) return res.status(404).json({ error: 'Cita no encontrada.' });
+
+        const [serviciosRows] = await pool.promise().query(
+            'SELECT id_servicio AS id, nombre, precio, duracion FROM cita_servicios WHERE id_cita = ?', [id]
+        );
+        const cita = {
+            ...rows[0],
+            comprobante_url: rows[0].comprobante ? buildUrl(req, rows[0].comprobante) : null,
+            servicios: serviciosRows.length > 0
+                ? serviciosRows
+                : [{ id: rows[0].id_servicio, nombre: rows[0].nombre_servicio, precio: parseFloat(rows[0].precio) }],
+            total_servicios: serviciosRows.length > 0
+                ? serviciosRows.reduce((s, r) => s + parseFloat(r.precio), 0)
+                : parseFloat(rows[0].precio)
+        };
+        res.status(200).json({ cita });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al consultar cita.' });
     }
 });
 
-// Actualizar cita por id (PUT /citas/:id)
+// PUT /citas/:id — actualizar cita
 app.put('/citas/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const { id_usuario, id_servicio, fecha_hora, estado, notas } = req.body;
+        const { id_usuario, id_servicio, id_barbero, fecha_hora, estado, notas } = req.body;
 
-        // Validar formato de fecha si se envía
         if (fecha_hora) {
             const fechaRegex = /^\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}(:\d{2})?$/;
-            if (!fechaRegex.test(fecha_hora)) {
-                return res.status(400).json({ error: 'Formato de fecha inválido. Use: YYYY-MM-DD HH:mm:ss' });
-            }
-
-            const fecha = new Date(fecha_hora);
-            if (isNaN(fecha.getTime())) {
-                return res.status(400).json({ error: 'Fecha inválida.' });
-            }
-
-            const year = fecha_hora.split(/[\sT-]/)[0];
-            if (year.length !== 4) {
-                return res.status(400).json({ error: `Año inválido: ${year}. Debe tener 4 dígitos (ej: 2026).` });
-            }
+            if (!fechaRegex.test(fecha_hora) || isNaN(new Date(fecha_hora).getTime()))
+                return res.status(400).json({ error: 'Formato de fecha inválido.' });
         }
+        const estadosValidos = ['reservada', 'confirmada', 'completada', 'cancelada'];
+        if (estado && !estadosValidos.includes(estado))
+            return res.status(400).json({ error: `Estado no válido. Opciones: ${estadosValidos.join(', ')}.` });
 
-        const estadosValidos = ['confirmada', 'completada', 'cancelada'];
-        if (estado && !estadosValidos.includes(estado)) {
-            return res.status(400).json({ error: 'Estado no válido. Debe ser: confirmada, completada o cancelada.' });
-        }
-        // Obtener la duración del servicio (en minutos)
-        const [servicioCheck] = await pool.promise().query(
-            'SELECT duracion FROM servicios WHERE id = ?',
-            [id_servicio]
-        );
-        if (servicioCheck.length === 0) {
-            return res.status(404).json({ error: 'Servicio no encontrado.' });
-        }
-        const duracionNueva = servicioCheck[0].duracion || 0;
-
-        // Verificar solapamiento excluyendo la cita actual (al editar)
-        const [existing] = await pool.promise().query(`
-            SELECT c.id FROM citas c
-            INNER JOIN servicios s ON c.id_servicio = s.id
-            WHERE c.estado != 'cancelada'
-            AND c.id != ?
-            AND ? < DATE_ADD(c.fecha_hora, INTERVAL COALESCE(s.duracion, 0) MINUTE)
-            AND DATE_ADD(?, INTERVAL ? MINUTE) > c.fecha_hora
-        `, [id, fecha_hora, fecha_hora, duracionNueva]);
-        if (existing.length > 0) {
-            return res.status(409).json({ error: 'El horario se solapa con otra cita existente.' });
+        if (fecha_hora && id_servicio) {
+            const [svc] = await pool.promise().query('SELECT duracion FROM servicios WHERE id = ?', [id_servicio]);
+            if (svc.length === 0) return res.status(404).json({ error: 'Servicio no encontrado.' });
+            const duracion = svc[0].duracion || 0;
+            const [existing] = await pool.promise().query(`
+                SELECT c.id FROM citas c INNER JOIN servicios s ON c.id_servicio = s.id
+                WHERE c.estado != 'cancelada' AND c.id != ?
+                AND ? < DATE_ADD(c.fecha_hora, INTERVAL COALESCE(s.duracion,0) MINUTE)
+                AND DATE_ADD(?, INTERVAL ? MINUTE) > c.fecha_hora
+            `, [id, fecha_hora, fecha_hora, duracion]);
+            if (existing.length > 0) return res.status(409).json({ error: 'El horario se solapa con otra cita.' });
         }
         await pool.promise().query(
-            'UPDATE citas SET id_usuario = ?, id_servicio = ?, fecha_hora = ?, estado = ?, notas = ? WHERE id = ?',
-            [id_usuario, id_servicio, fecha_hora, estado, notas, id]
+            'UPDATE citas SET id_usuario=?, id_servicio=?, id_barbero=?, fecha_hora=?, estado=?, notas=? WHERE id=?',
+            [id_usuario, id_servicio, id_barbero || null, fecha_hora, estado, notas, id]
         );
-        res.json({ mensaje: 'Cita actualizada correctamente' });
+        res.json({ mensaje: 'Cita actualizada correctamente.' });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al actualizar cita.' });
     }
 });
 
-// Actualizar solo el estado de una cita (PATCH /citas/:id/estado)
+// PATCH /citas/:id/estado — cambio rápido de estado
 app.patch('/citas/:id/estado', async (req, res) => {
     try {
         const { id } = req.params;
-        const { estado } = req.body;
+        const { estado, motivo_cancelacion } = req.body;
+        if (!estado) return res.status(400).json({ error: 'Debes enviar el estado.' });
+        const estadosValidos = ['reservada', 'confirmada', 'completada', 'cancelada'];
+        if (!estadosValidos.includes(estado))
+            return res.status(400).json({ error: `Estado no válido. Opciones: ${estadosValidos.join(', ')}.` });
+        const [citaRows] = await pool.promise().query('SELECT id, estado FROM citas WHERE id = ?', [id]);
+        if (citaRows.length === 0) return res.status(404).json({ error: 'Cita no encontrada.' });
 
-        if (!estado) {
-            return res.status(400).json({ error: 'Debes enviar el estado.' });
+        await pool.promise().query('UPDATE citas SET estado = ? WHERE id = ?', [estado, id]);
+
+        // Mejora #9: al cancelar cita, rechazar todos los pagos pendientes
+        if (estado === 'cancelada') {
+            const nota = motivo_cancelacion ? `Cita cancelada: ${motivo_cancelacion}` : 'Cita cancelada';
+            const [pagosPendientes] = await pool.promise().query(
+                "SELECT id, estado, comprobante, id_usuario FROM pagos WHERE id_cita = ? AND estado IN ('pendiente', 'pendiente_aprobacion')",
+                [id]
+            );
+            for (const p of pagosPendientes) {
+                eliminarArchivo(p.comprobante);
+                await pool.promise().query(
+                    "UPDATE pagos SET estado='rechazado', admin_note=? WHERE id=?",
+                    [nota, p.id]
+                );
+                await registrarHistorial(p.id, p.estado, 'rechazado', null, nota);
+                // Notificar al cliente (mejora #5)
+                if (p.id_usuario) {
+                    await crearNotificacion(
+                        p.id_usuario, 'cita_cancelada',
+                        '❌ Cita cancelada',
+                        `Tu cita #${id} fue cancelada. ${motivo_cancelacion ? 'Motivo: ' + motivo_cancelacion : ''}`,
+                        p.id
+                    );
+                }
+            }
         }
 
-        const estadosValidos = ['confirmada', 'completada', 'cancelada'];
-        if (!estadosValidos.includes(estado)) {
-            return res.status(400).json({ error: 'Estado no válido. Debe ser: confirmada, completada o cancelada.' });
-        }
-
-        // Verificar que la cita existe y obtener info relevante
-        const [citaRows] = await pool.promise().query('SELECT * FROM citas WHERE id = ?', [id]);
-        if (citaRows.length === 0) {
-            return res.status(404).json({ error: 'Cita no encontrada.' });
-        }
-        const cita = citaRows[0];
-
-        // Actualizar solo el estado
-        await pool.promise().query(
-            'UPDATE citas SET estado = ? WHERE id = ?',
-            [estado, id]
-        );
-
-        // Nota: el registro de pago en efectivo lo hace el admin manualmente desde POST /admin/pagos
-        res.json({ mensaje: 'Estado de la cita actualizado correctamente', estado });
+        res.json({ mensaje: 'Estado actualizado.', estado });
     } catch (error) {
         console.error(error);
-        res.status(500).json({ error: 'Error al actualizar estado de la cita.' });
+        res.status(500).json({ error: 'Error al actualizar estado.' });
     }
 });
 
-// Eliminar cita por id (DELETE /citas/:id)
+// PUT /citas/:id/completar — barbero/admin marca el servicio como prestado
+// Solo aplica a citas CONFIRMADAS (ya pagadas)
+app.put('/citas/:id/completar', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) return res.status(400).json({ error: 'ID inválido.' });
+        const [rows] = await pool.promise().query('SELECT id, estado FROM citas WHERE id = ?', [id]);
+        if (rows.length === 0) return res.status(404).json({ error: 'Cita no encontrada.' });
+        if (rows[0].estado === 'completada') return res.status(400).json({ error: 'La cita ya fue completada.' });
+        if (rows[0].estado === 'cancelada') return res.status(400).json({ error: 'No se puede completar una cita cancelada.' });
+        if (rows[0].estado === 'reservada') return res.status(400).json({ error: 'La cita aún no está confirmada (pago pendiente).' });
+        await pool.promise().query("UPDATE citas SET estado = 'completada' WHERE id = ?", [id]);
+        res.json({ mensaje: 'Servicio prestado. Cita marcada como completada.', id_cita: id, estado: 'completada' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al completar cita.' });
+    }
+});
+
+// DELETE /citas/:id — elimina cita, servicios asociados y pagos
 app.delete('/citas/:id', async (req, res) => {
     let connection;
     try {
         const { id } = req.params;
         connection = await pool.promise().getConnection();
         await connection.beginTransaction();
-
-        // 1. Eliminar pagos asociados a la cita
+        await connection.query('DELETE FROM cita_servicios WHERE id_cita = ?', [id]);
         await connection.query('DELETE FROM pagos WHERE id_cita = ?', [id]);
-
-        // 2. Eliminar la cita
         const [result] = await connection.query('DELETE FROM citas WHERE id = ?', [id]);
-
         if (result.affectedRows === 0) {
             await connection.rollback();
             connection.release();
             return res.status(404).json({ error: 'Cita no encontrada.' });
         }
-
         await connection.commit();
         connection.release();
-        res.json({ mensaje: 'Cita eliminada correctamente' });
+        res.json({ mensaje: 'Cita eliminada correctamente.' });
     } catch (error) {
-        if (connection) {
-            await connection.rollback();
-            connection.release();
-        }
-        console.error('❌ Error al eliminar cita:', error.message);
+        if (connection) { await connection.rollback(); connection.release(); }
+        console.error(error);
         res.status(500).json({ error: 'Error al eliminar cita: ' + error.message });
     }
 });
 
-// Verificar disponibilidad de horario (GET /citas/disponibilidad/:fecha_hora?id_servicio=X)
-// id_servicio es opcional: si se provee, usa la duración del servicio para detectar solapamientos
+// GET /citas/disponibilidad/:fecha_hora?id_servicio=X&id_barbero=Y
 app.get('/citas/disponibilidad/:fecha_hora', async (req, res) => {
     try {
         const { fecha_hora } = req.params;
-        const { id_servicio } = req.query;
-
-        let duracionNueva = 0;
+        const { id_servicio, id_barbero } = req.query;
+        let duracion = 0;
         if (id_servicio) {
-            const [servicioRows] = await pool.promise().query(
-                'SELECT duracion FROM servicios WHERE id = ?',
-                [parseInt(id_servicio)]
-            );
-            if (servicioRows.length === 0) {
-                return res.status(404).json({ error: 'Servicio no encontrado.' });
-            }
-            duracionNueva = servicioRows[0].duracion || 0;
+            const [svc] = await pool.promise().query('SELECT duracion FROM servicios WHERE id = ?', [parseInt(id_servicio)]);
+            if (svc.length === 0) return res.status(404).json({ error: 'Servicio no encontrado.' });
+            duracion = svc[0].duracion || 0;
         }
-
-        // Verificar solapamiento considerando duración
-        const [existing] = await pool.promise().query(`
+        const barberoId = id_barbero ? parseInt(id_barbero) : null;
+        const baseQ = `
             SELECT c.id FROM citas c
+            LEFT JOIN (SELECT id_cita, SUM(duracion) AS dur FROM cita_servicios GROUP BY id_cita) cs ON cs.id_cita = c.id
             INNER JOIN servicios s ON c.id_servicio = s.id
-            WHERE c.estado != 'cancelada'
-            AND ? < DATE_ADD(c.fecha_hora, INTERVAL COALESCE(s.duracion, 0) MINUTE)
+            WHERE c.estado NOT IN ('cancelada')
+            AND ? < DATE_ADD(c.fecha_hora, INTERVAL COALESCE(cs.dur, s.duracion, 0) MINUTE)
             AND DATE_ADD(?, INTERVAL ? MINUTE) > c.fecha_hora
-        `, [fecha_hora, fecha_hora, duracionNueva]);
-
+        `;
+        const params = barberoId ? [fecha_hora, fecha_hora, duracion, barberoId] : [fecha_hora, fecha_hora, duracion];
+        const suffix = barberoId ? ' AND c.id_barbero = ?' : '';
+        const [existing] = await pool.promise().query(baseQ + suffix, params);
         const disponible = existing.length === 0;
-        res.status(200).json({
-            disponible,
-            mensaje: disponible ? 'Horario disponible' : 'Horario ocupado',
-            duracion_minutos: duracionNueva || null
-        });
+        res.status(200).json({ disponible, mensaje: disponible ? 'Horario disponible' : 'Horario ocupado', duracion_minutos: duracion });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al verificar disponibilidad.' });
@@ -700,243 +755,450 @@ app.get('/citas/disponibilidad/:fecha_hora', async (req, res) => {
 
 // ==================== PAGOS ====================
 /*
-  ⚠️  SQL MIGRATION - Ejecuta esto en tu base de datos MySQL si aún no lo has hecho:
+  ⚠️  SQL MIGRATION v2 — Ejecuta en phpMyAdmin ANTES de arrancar:
 
-  -- Estructura actual de la tabla pagos (confirma con DESCRIBE pagos):
+  -- 1. Tabla multi-servicio por cita
+  CREATE TABLE IF NOT EXISTS cita_servicios (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    id_cita     INT NOT NULL,
+    id_servicio INT NOT NULL,
+    nombre      VARCHAR(255) NOT NULL,
+    precio      DECIMAL(10,2) NOT NULL,
+    duracion    INT NOT NULL DEFAULT 0,
+    FOREIGN KEY (id_cita)     REFERENCES citas(id)    ON DELETE CASCADE,
+    FOREIGN KEY (id_servicio) REFERENCES servicios(id)
+  );
+
+  -- 2. Barbero en citas
+  ALTER TABLE citas
+    ADD COLUMN IF NOT EXISTS id_barbero INT NULL AFTER id_servicio;
+
+  -- 3. Campos nuevos en pagos
   ALTER TABLE pagos
-    CHANGE COLUMN fecha_pago fecha DATETIME NOT NULL,
-    ADD COLUMN id_usuario INT NULL AFTER id_cita,
-    ADD COLUMN estado ENUM('pendiente','aprobado','rechazado') DEFAULT 'pendiente' AFTER metodo,
-    ADD COLUMN comprobante TEXT NULL AFTER estado,
-    ADD COLUMN referencia VARCHAR(500) NULL AFTER comprobante;
+    ADD COLUMN IF NOT EXISTS subtotal        DECIMAL(10,2) NOT NULL DEFAULT 0    AFTER monto,
+    ADD COLUMN IF NOT EXISTS discount_amount DECIMAL(10,2) NOT NULL DEFAULT 0    AFTER subtotal,
+    ADD COLUMN IF NOT EXISTS tip_amount      DECIMAL(10,2) NOT NULL DEFAULT 0    AFTER discount_amount,
+    ADD COLUMN IF NOT EXISTS monto_recibido  DECIMAL(10,2) NULL                  AFTER tip_amount,
+    ADD COLUMN IF NOT EXISTS cambio          DECIMAL(10,2) NULL                  AFTER monto_recibido,
+    ADD COLUMN IF NOT EXISTS admin_id        INT NULL                             AFTER referencia,
+    ADD COLUMN IF NOT EXISTS admin_note      TEXT NULL                            AFTER admin_id,
+    ADD COLUMN IF NOT EXISTS reviewed_at     DATETIME NULL                        AFTER admin_note,
+    ADD COLUMN IF NOT EXISTS transaction_id  VARCHAR(255) NULL                    AFTER reviewed_at,
+    ADD COLUMN IF NOT EXISTS reference_code  VARCHAR(100) NULL                    AFTER transaction_id,
+    ADD COLUMN IF NOT EXISTS paid_at         DATETIME NULL                        AFTER reference_code;
 
-  -- Si comprobante ya existe como VARCHAR(500), ampliar a TEXT para rutas largas:
-  ALTER TABLE pagos MODIFY COLUMN comprobante TEXT NULL;
+  -- 4. Ampliar ENUMs
+  ALTER TABLE pagos
+    MODIFY COLUMN metodo ENUM('efectivo','tarjeta','transferencia','nequi','daviplata') NOT NULL DEFAULT 'efectivo',
+    MODIFY COLUMN estado ENUM('pendiente','pendiente_aprobacion','autorizado','completado','rechazado','fallido','reembolsado') NOT NULL DEFAULT 'pendiente';
 
-  -- Rellenar id_usuario de pagos existentes
-  UPDATE pagos p INNER JOIN citas c ON p.id_cita = c.id SET p.id_usuario = c.id_usuario WHERE p.id_usuario IS NULL;
+  ALTER TABLE citas
+    MODIFY COLUMN estado ENUM('reservada','confirmada','completada','cancelada') NOT NULL DEFAULT 'reservada';
 
-  -- Marcar pagos existentes de citas completadas como aprobados
-  UPDATE pagos p INNER JOIN citas c ON p.id_cita = c.id SET p.estado = 'aprobado' WHERE c.estado = 'completada';
+  -- 5. Migrar datos existentes
+  UPDATE pagos SET estado = 'completado'           WHERE estado = 'aprobado';
+  UPDATE pagos SET estado = 'pendiente_aprobacion' WHERE estado = 'pendiente' AND comprobante IS NOT NULL;
+  UPDATE pagos SET subtotal = monto                WHERE subtotal = 0;
+  UPDATE citas SET estado = 'confirmada'           WHERE estado = 'pendiente';
+
+  -- 6. Historial de cambios de estado en pagos (mejora #2)
+  CREATE TABLE IF NOT EXISTS pagos_historial (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    id_pago         INT NOT NULL,
+    estado_anterior VARCHAR(50) NULL,
+    estado_nuevo    VARCHAR(50) NOT NULL,
+    admin_id        INT NULL,
+    nota            TEXT NULL,
+    fecha           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (id_pago) REFERENCES pagos(id) ON DELETE CASCADE
+  );
+
+  -- 7. Notificaciones automáticas (mejora #5)
+  CREATE TABLE IF NOT EXISTS notificaciones (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    id_usuario  INT NOT NULL,
+    tipo        VARCHAR(50) NOT NULL,
+    titulo      VARCHAR(255) NOT NULL,
+    mensaje     TEXT NOT NULL,
+    leida       TINYINT(1) NOT NULL DEFAULT 0,
+    id_ref      INT NULL COMMENT 'id_pago o id_cita relacionado',
+    fecha       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (id_usuario) REFERENCES usuarios(id) ON DELETE CASCADE
+  );
+
+  -- 8. Índices de rendimiento
+  CREATE INDEX IF NOT EXISTS idx_pagos_id_cita   ON pagos (id_cita);
+  CREATE INDEX IF NOT EXISTS idx_pagos_id_usuario ON pagos (id_usuario);
+  CREATE INDEX IF NOT EXISTS idx_pagos_estado     ON pagos (estado);
+  CREATE INDEX IF NOT EXISTS idx_notif_usuario    ON notificaciones (id_usuario, leida);
 */
 
-// ── CLIENTE: Registrar pago con comprobante (POST /pagos) ──
-// Solo transferencia o tarjeta. El comprobante es OBLIGATORIO.
-// Enviar como multipart/form-data: id_cita, id_usuario, metodo, referencia (opcional), comprobante (archivo)
-app.post('/pagos', upload.single('comprobante'), async (req, res) => {
-    // Si multer rechazó el archivo, el error llega aquí
+/*
+  ── FLUJO COMPLETO ──────────────────────────────────────────
+  POST /citas               → cita: RESERVADA   + pago: PENDIENTE
+
+  ── EFECTIVO (en el local) ────────────────────────────
+  POST /admin/pagos/efectivo → pago: COMPLETADO + cita: CONFIRMADA
+  PUT  /citas/:id/completar  → cita: COMPLETADA (servicio prestado)
+
+  ── TRANSFERENCIA / NEQUI / DAVIPLATA ────────────────
+  POST /pagos                    → pago: PENDIENTE_APROBACION
+  PUT  /pagos/:id/aprobar        → pago: COMPLETADO + cita: CONFIRMADA ✅
+  PUT  /pagos/:id/rechazar       → pago: RECHAZADO (admin explica motivo) ❌
+  PATCH /pagos/:id/solicitar-info→ admin pide datos (sin cambiar estado)
+
+  ── DESPUÉS DEL SERVICIO ───────────────────────────
+  PUT /citas/:id/completar       → cita: COMPLETADA (barbero marcó servicio prestado)
+  PUT /pagos/:id/reembolsar      → pago: REEMBOLSADO
+
+  GET /comprobante/:id_pago      → PDF comprobante de pago
+*/
+
+// Helper interno
+const buildUrl = (req, filePath) => filePath ? `${req.protocol}://${req.get('host')}${filePath}` : null;
+
+// ── Helper: registrar historial de cambio de estado en pago (mejora #2) ─────────
+const registrarHistorial = async (id_pago, estado_anterior, estado_nuevo, admin_id = null, nota = null) => {
     try {
-        const { id_cita, id_usuario, metodo, referencia } = req.body;
+        await pool.promise().query(
+            'INSERT INTO pagos_historial (id_pago, estado_anterior, estado_nuevo, admin_id, nota) VALUES (?, ?, ?, ?, ?)',
+            [id_pago, estado_anterior || null, estado_nuevo, admin_id || null, nota || null]
+        );
+    } catch (e) { console.error('[historial] Error:', e.message); }
+};
+
+// ── Helper: crear notificación para un usuario (mejora #5) ───────────────────────
+const crearNotificacion = async (id_usuario, tipo, titulo, mensaje, id_ref = null) => {
+    try {
+        await pool.promise().query(
+            'INSERT INTO notificaciones (id_usuario, tipo, titulo, mensaje, id_ref) VALUES (?, ?, ?, ?, ?)',
+            [id_usuario, tipo, titulo, mensaje, id_ref || null]
+        );
+    } catch (e) { console.error('[notificacion] Error:', e.message); }
+};
+
+// ── Helper: notificar a todos los admins (mejora #5) ─────────────────────────────
+const notificarAdmins = async (tipo, titulo, mensaje, id_ref = null) => {
+    try {
+        const [admins] = await pool.promise().query("SELECT id FROM usuarios WHERE rol = 'admin'");
+        for (const a of admins) {
+            await crearNotificacion(a.id, tipo, titulo, mensaje, id_ref);
+        }
+    } catch (e) { console.error('[notif-admins] Error:', e.message); }
+};
+
+// ── Helper: limpiar comprobante del disco ────────────────────────────────────────
+const eliminarArchivo = (rutaRelativa) => {
+    if (!rutaRelativa) return;
+    try {
+        const ruta = path.join(__dirname, rutaRelativa);
+        if (fs.existsSync(ruta)) fs.unlinkSync(ruta);
+    } catch (e) { console.error('[archivo] Error al eliminar:', e.message); }
+};
+
+// ── POST /pagos ── Cliente sube comprobante de pago ─────────────────────────────
+// multipart/form-data: id_cita, id_usuario, metodo, referencia?, transaction_id?, comprobante(file)
+app.post('/pagos', upload.single('comprobante'), async (req, res) => {
+    try {
+        const { id_cita, id_usuario, metodo, referencia, transaction_id } = req.body;
 
         if (!id_cita || !id_usuario || !metodo) {
-            if (req.file) fs.unlinkSync(req.file.path);
-            return res.status(400).json({ error: 'Faltan datos obligatorios: id_cita, id_usuario, metodo.' });
+            if (req.file) eliminarArchivo('/' + path.relative(__dirname, req.file.path).replace(/\\/g, '/'));
+            return res.status(400).json({ error: 'Faltan datos: id_cita, id_usuario, metodo.' });
         }
 
-        const metodosValidos = ['transferencia', 'tarjeta'];
+        const metodosValidos = ['transferencia', 'tarjeta', 'nequi', 'daviplata'];
         if (!metodosValidos.includes(metodo)) {
-            if (req.file) fs.unlinkSync(req.file.path);
-            return res.status(400).json({ error: 'Solo puedes registrar pagos por transferencia o tarjeta. El efectivo lo registra el administrador.' });
+            if (req.file) eliminarArchivo('/' + path.relative(__dirname, req.file.path).replace(/\\/g, '/'));
+            return res.status(400).json({ error: 'Método inválido. Usa: transferencia, tarjeta, nequi o daviplata. El efectivo lo registra el administrador.' });
         }
 
-        // Comprobante obligatorio para transferencia y tarjeta
         if (!req.file) {
-            return res.status(400).json({ error: 'Debes adjuntar el comprobante de pago (imagen JPG/PNG o PDF, máx. 5 MB).' });
+            return res.status(400).json({ error: 'Debes adjuntar el comprobante de pago (JPG/PNG/PDF, máx. 5 MB).' });
         }
 
         // Verificar que la cita existe y pertenece al usuario
         const [citaRows] = await pool.promise().query(
             `SELECT c.id, c.estado, s.precio, s.nombre AS nombre_servicio
-             FROM citas c
-             INNER JOIN servicios s ON c.id_servicio = s.id
+             FROM citas c INNER JOIN servicios s ON c.id_servicio = s.id
              WHERE c.id = ? AND c.id_usuario = ?`,
             [id_cita, id_usuario]
         );
         if (citaRows.length === 0) {
-            fs.unlinkSync(req.file.path);
+            eliminarArchivo('/' + path.relative(__dirname, req.file.path).replace(/\\/g, '/'));
             return res.status(404).json({ error: 'Cita no encontrada o no pertenece al usuario.' });
         }
         if (citaRows[0].estado === 'cancelada') {
-            fs.unlinkSync(req.file.path);
-            return res.status(400).json({ error: 'No se puede registrar pago para una cita cancelada.' });
+            eliminarArchivo('/' + path.relative(__dirname, req.file.path).replace(/\\/g, '/'));
+            return res.status(400).json({ error: 'No se puede pagar una cita cancelada.' });
         }
         if (citaRows[0].estado === 'completada') {
-            fs.unlinkSync(req.file.path);
+            eliminarArchivo('/' + path.relative(__dirname, req.file.path).replace(/\\/g, '/'));
             return res.status(400).json({ error: 'Esta cita ya fue completada y pagada.' });
         }
 
-        // Verificar que no exista ya un pago pendiente o aprobado para esta cita
-        const [pagoExistente] = await pool.promise().query(
-            "SELECT id, estado FROM pagos WHERE id_cita = ? AND estado IN ('pendiente','aprobado')",
+        // Permitir múltiples pagos: solo bloquear si el total de pagos completados cubre el monto total
+        const [pagosCita] = await pool.promise().query(
+            "SELECT monto, estado FROM pagos WHERE id_cita = ?",
             [id_cita]
         );
-        if (pagoExistente.length > 0) {
-            fs.unlinkSync(req.file.path);
-            const estadoActual = pagoExistente[0].estado;
+        const pagosCompletados = pagosCita.filter(p => p.estado === 'completado');
+        const sumaPagos = pagosCompletados.reduce((s, p) => s + parseFloat(p.monto), 0);
+        // Obtener el total de la cita (sumando servicios)
+        const [serviciosRows] = await pool.promise().query(
+            'SELECT precio FROM cita_servicios WHERE id_cita = ?', [id_cita]
+        );
+        const totalCita = serviciosRows.reduce((s, r) => s + parseFloat(r.precio), 0);
+        if (sumaPagos >= totalCita) {
+            eliminarArchivo('/' + path.relative(__dirname, req.file.path).replace(/\\/g, '/'));
             return res.status(409).json({
-                error: estadoActual === 'aprobado'
-                    ? 'Esta cita ya tiene un pago aprobado.'
-                    : 'Ya enviaste un comprobante para esta cita. Espera la aprobación del administrador.'
+                error: 'Esta cita ya está pagada en su totalidad.'
             });
         }
 
-        const monto = citaRows[0].precio;
-        const fecha = new Date().toISOString().slice(0, 19).replace('T', ' ');
-        // Guardar ruta relativa del comprobante (accesible vía /uploads/comprobantes/:archivo)
-        const urlComprobante = `/uploads/comprobantes/${req.file.filename}`;
+        // Ruta relativa desde __dirname (incluye subdirectorio año/mes) (mejora #6)
+        const urlComprobante = '/' + path.relative(__dirname, req.file.path).replace(/\\/g, '/');
+        const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
-        const [result] = await pool.promise().query(
-            "INSERT INTO pagos (id_cita, id_usuario, monto, metodo, estado, comprobante, referencia, fecha) VALUES (?, ?, ?, ?, 'pendiente', ?, ?, ?)",
-            [id_cita, id_usuario, monto, metodo, urlComprobante, referencia || null, fecha]
+        // Buscar pago activo: primero 'pendiente', luego 'pendiente_aprobacion'
+        // (cubre el caso de re-envío de comprobante sin haber sido rechazado)
+        const [pagoPendiente] = await pool.promise().query(
+            `SELECT * FROM pagos
+             WHERE id_cita = ? AND estado IN ('pendiente', 'pendiente_aprobacion')
+             ORDER BY FIELD(estado,'pendiente','pendiente_aprobacion'), fecha DESC
+             LIMIT 1`,
+            [id_cita]
+        );
+
+        let id_pago, subtotal, total;
+
+        if (pagoPendiente.length > 0) {
+            // ACTUALIZAR el pago con el comprobante y método real elegido por el usuario
+            const p = pagoPendiente[0];
+            subtotal = parseFloat(p.subtotal || p.monto);
+            total = subtotal;
+            // Borrar comprobante anterior si existe
+            if (p.comprobante) {
+                const fAnterior = path.join(__dirname, p.comprobante);
+                if (fs.existsSync(fAnterior)) fs.unlinkSync(fAnterior);
+            }
+            await pool.promise().query(
+                `UPDATE pagos SET metodo=?, estado='pendiente_aprobacion',
+                  comprobante=?, referencia=?, transaction_id=?, fecha=? WHERE id=?`,
+                [metodo, urlComprobante, referencia || null, transaction_id || null, now, p.id]
+            );
+            id_pago = p.id;
+            // Registrar historial (mejora #2)
+            await registrarHistorial(id_pago, p.estado, 'pendiente_aprobacion', null, 'Comprobante subido por cliente');
+        } else {
+            // Sin pago activo: limpiar rechazado anterior y crear nuevo
+            const [pagoRechazado] = await pool.promise().query(
+                "SELECT id, comprobante FROM pagos WHERE id_cita = ? AND estado = 'rechazado' ORDER BY fecha DESC LIMIT 1",
+                [id_cita]
+            );
+            if (pagoRechazado.length > 0) {
+                eliminarArchivo(pagoRechazado[0].comprobante);
+                await pool.promise().query('DELETE FROM pagos WHERE id = ?', [pagoRechazado[0].id]);
+            }
+            subtotal = parseFloat(citaRows[0].precio);
+            total = subtotal;
+            const [result] = await pool.promise().query(
+                `INSERT INTO pagos
+                   (id_cita, id_usuario, subtotal, monto, metodo, estado,
+                    comprobante, referencia, transaction_id, fecha)
+                 VALUES (?, ?, ?, ?, ?, 'pendiente_aprobacion', ?, ?, ?, ?)`,
+                [id_cita, id_usuario, subtotal, total, metodo,
+                    urlComprobante, referencia || null, transaction_id || null, now]
+            );
+            id_pago = result.insertId;
+            // Registrar historial (mejora #2)
+            await registrarHistorial(id_pago, null, 'pendiente_aprobacion', null, 'Comprobante subido por cliente');
+        }
+
+        // Notificar a admins que hay un nuevo comprobante pendiente (mejora #5)
+        await notificarAdmins(
+            'pago_pendiente',
+            'Nuevo comprobante de pago',
+            `El cliente ${id_usuario} subió comprobante para la cita #${id_cita} (método: ${metodo}).`,
+            id_pago
         );
 
         res.status(201).json({
-            mensaje: 'Comprobante enviado correctamente. El administrador revisará y confirmará tu pago.',
-            id_pago: result.insertId,
-            monto,
+            mensaje: 'Comprobante enviado. El administrador revisará y confirmará tu pago.',
+            id_pago,
+            subtotal,
+            total,
             nombre_servicio: citaRows[0].nombre_servicio,
-            comprobante: urlComprobante,
-            comprobante_url: `${req.protocol}://${req.get('host')}${urlComprobante}`,
-            estado: 'pendiente'
+            estado: 'pendiente_aprobacion',
+            comprobante_url: buildUrl(req, urlComprobante)
         });
     } catch (error) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        if (req.file) {
+            try { fs.unlinkSync(req.file.path); } catch (_) { }
+        }
         console.error(error);
         res.status(500).json({ error: 'Error al registrar pago.' });
     }
 });
 
-// ── CLIENTE: Ver mis pagos (GET /mis-pagos?id_usuario=X) ──
+// ── GET /mis-pagos?id_usuario=X ── Cliente ve su historial ──────────────────────
 app.get('/mis-pagos', async (req, res) => {
     try {
         const { id_usuario } = req.query;
-        if (!id_usuario) {
-            return res.status(400).json({ error: 'ID de usuario requerido.' });
-        }
+        if (!id_usuario || isNaN(parseInt(id_usuario)))
+            return res.status(400).json({ error: 'id_usuario requerido y debe ser número.' });
+
         const [rows] = await pool.promise().query(`
-            SELECT
-                p.id, p.id_cita, p.id_usuario, p.monto, p.metodo, p.estado,
-                DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
-                p.comprobante, p.referencia,
-                s.nombre AS nombre_servicio,
-                DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
-                c.estado AS estado_cita
+            SELECT p.id, p.id_cita, p.id_usuario,
+                   p.subtotal, p.monto AS total, p.discount_amount, p.tip_amount,
+                   p.metodo, p.estado,
+                   DATE_FORMAT(p.fecha,        '%Y-%m-%d %H:%i:%s') AS created_at,
+                   DATE_FORMAT(p.paid_at,      '%Y-%m-%d %H:%i:%s') AS paid_at,
+                   DATE_FORMAT(p.reviewed_at,  '%Y-%m-%d %H:%i:%s') AS reviewed_at,
+                   p.comprobante, p.referencia, p.transaction_id, p.reference_code,
+                   p.admin_note,
+                   s.nombre AS nombre_servicio, s.precio,
+                   DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
+                   c.estado AS estado_cita
             FROM pagos p
-            INNER JOIN citas c ON p.id_cita = c.id
+            INNER JOIN citas    c ON p.id_cita    = c.id
             INNER JOIN servicios s ON c.id_servicio = s.id
             WHERE p.id_usuario = ?
             ORDER BY p.fecha DESC
         `, [parseInt(id_usuario)]);
-        res.status(200).json({ pagos: rows });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Error al consultar tus pagos.' });
-    }
-});
 
-// ── ADMIN: Pagos pendientes de revisión (GET /pagos/pendientes) ──
-// Devuelve solo los pagos con comprobante enviado y estado 'pendiente'
-app.get('/pagos/pendientes', async (req, res) => {
-    try {
-        const [rows] = await pool.promise().query(`
-            SELECT
-                p.id, p.id_cita, p.id_usuario, p.monto, p.metodo, p.estado,
-                DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
-                p.comprobante, p.referencia,
-                u.nombre AS nombre_cliente, u.email AS email_cliente, u.telefono AS telefono_cliente,
-                s.nombre AS nombre_servicio, s.precio,
-                DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
-                c.estado AS estado_cita
-            FROM pagos p
-            LEFT JOIN citas c ON p.id_cita = c.id
-            LEFT JOIN servicios s ON c.id_servicio = s.id
-            LEFT JOIN usuarios u ON p.id_usuario = u.id
-            WHERE p.estado = 'pendiente'
-              AND p.comprobante IS NOT NULL
-            ORDER BY p.fecha ASC
-        `);
-        const base = `${req.protocol}://${req.get('host')}`;
-        const pendientesConUrl = rows.map(r => ({
-            ...r,
-            comprobante_url: r.comprobante ? `${base}${r.comprobante}` : null
-        }));
-        res.status(200).json({ pendientes: pendientesConUrl, total: pendientesConUrl.length });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Error al consultar pagos pendientes.' });
-    }
-});
-
-// ── ADMIN: Listar todos los pagos con filtros (GET /pagos) ──
-app.get('/pagos', async (req, res) => {
-    try {
-        const { estado, metodo, id_usuario, fecha_desde, fecha_hasta } = req.query;
-        let query = `
-            SELECT
-                p.id, p.id_cita, p.id_usuario, p.monto, p.metodo, p.estado,
-                DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
-                p.comprobante, p.referencia,
-                u.nombre AS nombre_cliente, u.email AS email_cliente,
-                s.nombre AS nombre_servicio,
-                DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
-                c.estado AS estado_cita
-            FROM pagos p
-            INNER JOIN citas c ON p.id_cita = c.id
-            INNER JOIN servicios s ON c.id_servicio = s.id
-            LEFT JOIN usuarios u ON p.id_usuario = u.id
-        `;
-        const conditions = [];
-        const params = [];
-        if (estado) { conditions.push('p.estado = ?'); params.push(estado); }
-        if (metodo) { conditions.push('p.metodo = ?'); params.push(metodo); }
-        if (id_usuario) { conditions.push('p.id_usuario = ?'); params.push(parseInt(id_usuario)); }
-        if (fecha_desde) { conditions.push('DATE(p.fecha) >= ?'); params.push(fecha_desde); }
-        if (fecha_hasta) { conditions.push('DATE(p.fecha) <= ?'); params.push(fecha_hasta); }
-        if (conditions.length > 0) query += ' WHERE ' + conditions.join(' AND ');
-        query += ' ORDER BY p.fecha DESC';
-        const [rows] = await pool.promise().query(query, params);
-        const base = `${req.protocol}://${req.get('host')}`;
-        const pagosConUrl = rows.map(r => ({
-            ...r,
-            comprobante_url: r.comprobante ? `${base}${r.comprobante}` : null
-        }));
-        res.status(200).json({ pagos: pagosConUrl });
+        res.status(200).json({
+            pagos: rows.map(r => ({ ...r, comprobante_url: buildUrl(req, r.comprobante) })),
+            total: rows.length
+        });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al consultar pagos.' });
     }
 });
 
-// ── ADMIN/CLIENTE: Ver pago por id (GET /pagos/:id) ──
+// ── GET /pagos/pendientes ── Admin: comprobantes esperando revisión ───────────────
+app.get('/pagos/pendientes', async (req, res) => {
+    try {
+        const [rows] = await pool.promise().query(`
+            SELECT p.id, p.id_cita, p.id_usuario,
+                   p.subtotal, p.monto AS total, p.metodo, p.estado,
+                   DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS created_at,
+                   p.comprobante, p.referencia, p.transaction_id,
+                   u.nombre AS nombre_cliente, u.email AS email_cliente, u.telefono AS telefono_cliente,
+                   s.nombre AS nombre_servicio, s.precio,
+                   DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
+                   c.estado AS estado_cita
+            FROM pagos p
+            LEFT JOIN citas    c  ON p.id_cita    = c.id
+            LEFT JOIN servicios s ON c.id_servicio = s.id
+            LEFT JOIN usuarios  u ON p.id_usuario  = u.id
+            WHERE p.estado = 'pendiente_aprobacion'
+            ORDER BY p.fecha ASC
+        `);
+        res.status(200).json({
+            pendientes: rows.map(r => ({ ...r, comprobante_url: buildUrl(req, r.comprobante) })),
+            total: rows.length
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar pagos pendientes.' });
+    }
+});
+
+// ── GET /pagos ── Admin: listado completo con filtros ────────────────────────────
+app.get('/pagos', async (req, res) => {
+    try {
+        const { estado, metodo, id_usuario, fecha_desde, fecha_hasta } = req.query;
+        let query = `
+            SELECT p.id, p.id_cita, p.id_usuario,
+                   p.subtotal, p.monto AS total, p.discount_amount, p.tip_amount,
+                   p.metodo, p.estado,
+                   DATE_FORMAT(p.fecha,       '%Y-%m-%d %H:%i:%s') AS created_at,
+                   DATE_FORMAT(p.paid_at,     '%Y-%m-%d %H:%i:%s') AS paid_at,
+                   DATE_FORMAT(p.reviewed_at, '%Y-%m-%d %H:%i:%s') AS reviewed_at,
+                   p.comprobante, p.referencia, p.transaction_id, p.reference_code,
+                   p.admin_note, p.admin_id,
+                   u.nombre AS nombre_cliente, u.email AS email_cliente,
+                   s.nombre AS nombre_servicio,
+                   DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
+                   c.estado AS estado_cita
+            FROM pagos p
+            INNER JOIN citas    c ON p.id_cita    = c.id
+            INNER JOIN servicios s ON c.id_servicio = s.id
+            LEFT JOIN  usuarios  u ON p.id_usuario  = u.id
+        `;
+        const conditions = [], params = [];
+        if (estado) { conditions.push('p.estado = ?'); params.push(estado); }
+        if (metodo) { conditions.push('p.metodo = ?'); params.push(metodo); }
+        if (id_usuario) { conditions.push('p.id_usuario = ?'); params.push(parseInt(id_usuario)); }
+        if (fecha_desde) { conditions.push('DATE(p.fecha) >= ?'); params.push(fecha_desde); }
+        if (fecha_hasta) { conditions.push('DATE(p.fecha) <= ?'); params.push(fecha_hasta); }
+        if (conditions.length) query += ' WHERE ' + conditions.join(' AND ');
+        query += ' ORDER BY p.fecha DESC';
+
+        const [rows] = await pool.promise().query(query, params);
+        res.status(200).json({
+            pagos: rows.map(r => ({ ...r, comprobante_url: buildUrl(req, r.comprobante) }))
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar pagos.' });
+    }
+});
+
+// ── GET /pagos/cita/:id_cita ── Todos los pagos de una cita ──────────────────────
+app.get('/pagos/cita/:id_cita', async (req, res) => {
+    try {
+        const { id_cita } = req.params;
+        const [rows] = await pool.promise().query(`
+            SELECT p.id, p.id_cita, p.id_usuario,
+                   p.subtotal, p.monto AS total, p.discount_amount, p.tip_amount,
+                   p.metodo, p.estado,
+                   DATE_FORMAT(p.fecha,   '%Y-%m-%d %H:%i:%s') AS created_at,
+                   DATE_FORMAT(p.paid_at, '%Y-%m-%d %H:%i:%s') AS paid_at,
+                   p.comprobante, p.referencia, p.transaction_id, p.reference_code,
+                   p.admin_note
+            FROM pagos p WHERE p.id_cita = ?
+            ORDER BY p.fecha DESC
+        `, [id_cita]);
+        res.status(200).json({
+            pagos: rows.map(r => ({ ...r, comprobante_url: buildUrl(req, r.comprobante) }))
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar pagos de la cita.' });
+    }
+});
+
+// ── GET /pagos/:id ── Ver detalle de un pago ─────────────────────────────────────
 app.get('/pagos/:id', async (req, res) => {
     try {
-        const { id } = req.params;
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) return res.status(400).json({ error: 'ID de pago inválido.' });
+
         const [rows] = await pool.promise().query(`
-            SELECT
-                p.id, p.id_cita, p.id_usuario, p.monto, p.metodo, p.estado,
-                DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
-                p.comprobante, p.referencia,
-                u.nombre AS nombre_cliente, u.email AS email_cliente, u.telefono AS telefono_cliente,
-                s.nombre AS nombre_servicio, s.precio,
-                DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
-                c.notas AS notas_cita,
-                c.estado AS estado_cita
+            SELECT p.*,
+                   DATE_FORMAT(p.fecha,       '%Y-%m-%d %H:%i:%s') AS created_at,
+                   DATE_FORMAT(p.paid_at,     '%Y-%m-%d %H:%i:%s') AS paid_at,
+                   DATE_FORMAT(p.reviewed_at, '%Y-%m-%d %H:%i:%s') AS reviewed_at,
+                   u.nombre  AS nombre_cliente,  u.email AS email_cliente, u.telefono AS telefono_cliente,
+                   s.nombre  AS nombre_servicio, s.precio,
+                   DATE_FORMAT(c.fecha_hora, '%Y-%m-%d %H:%i:%s') AS fecha_cita,
+                   c.estado  AS estado_cita,     c.notas AS notas_cita,
+                   a.nombre  AS nombre_admin
             FROM pagos p
-            INNER JOIN citas c ON p.id_cita = c.id
+            INNER JOIN citas    c ON p.id_cita    = c.id
             INNER JOIN servicios s ON c.id_servicio = s.id
-            LEFT JOIN usuarios u ON p.id_usuario = u.id
+            LEFT JOIN  usuarios  u ON p.id_usuario  = u.id
+            LEFT JOIN  usuarios  a ON p.admin_id    = a.id
             WHERE p.id = ?
         `, [id]);
-        if (rows.length === 0) {
-            return res.status(404).json({ error: 'Pago no encontrado.' });
-        }
+        if (rows.length === 0) return res.status(404).json({ error: 'Pago no encontrado.' });
+
         const pago = rows[0];
-        const base = `${req.protocol}://${req.get('host')}`;
         res.status(200).json({
-            pago: {
-                ...pago,
-                comprobante_url: pago.comprobante ? `${base}${pago.comprobante}` : null
-            }
+            pago: { ...pago, total: pago.monto, comprobante_url: buildUrl(req, pago.comprobante) }
         });
     } catch (error) {
         console.error(error);
@@ -944,72 +1206,155 @@ app.get('/pagos/:id', async (req, res) => {
     }
 });
 
-// ── ADMIN: Aprobar pago (PUT /pagos/:id/aprobar) ──
-// Aprueba el comprobante de pago y marca la cita como completada
-app.put('/pagos/:id/aprobar', async (req, res) => {
+// ── DELETE /pagos/:id ── Cliente cancela pago pendiente o rechazado ──────────────
+app.delete('/pagos/:id', async (req, res) => {
     try {
-        const { id } = req.params;
-        const [pagoRows] = await pool.promise().query(`
-            SELECT p.*, u.nombre AS nombre_cliente, s.nombre AS nombre_servicio
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) return res.status(400).json({ error: 'ID de pago inválido.' });
+
+        const [pagoRows] = await pool.promise().query('SELECT * FROM pagos WHERE id = ?', [id]);
+        if (pagoRows.length === 0) return res.status(404).json({ error: 'Pago no encontrado.' });
+        const pago = pagoRows[0];
+
+        // Permitir eliminar solo si el pago no está completado ni reembolsado
+        if (pago.estado === 'completado')
+            return res.status(400).json({ error: 'No puedes cancelar un pago ya completado.' });
+        if (pago.estado === 'reembolsado')
+            return res.status(400).json({ error: 'No puedes cancelar un pago reembolsado.' });
+
+        if (pago.comprobante) eliminarArchivo(pago.comprobante);
+        await pool.promise().query('DELETE FROM pagos WHERE id = ?', [id]);
+        res.json({ mensaje: 'Pago cancelado. Ya puedes registrar un nuevo comprobante.', id_pago_eliminado: id });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al cancelar el pago.' });
+    }
+});
+
+// ── PUT /pagos/:id/aprobar ── Admin aprueba comprobante ──────────────────────────
+// Body JSON: { admin_id, admin_note? }
+app.put('/pagos/:id/aprobar', async (req, res) => {
+    const connection = await pool.promise().getConnection();
+    try {
+        const id = parseInt(req.params.id);
+        const { admin_id, admin_note } = req.body;
+        if (isNaN(id)) { connection.release(); return res.status(400).json({ error: 'ID de pago inválido.' }); }
+        if (!admin_id) { connection.release(); return res.status(400).json({ error: 'Se requiere admin_id.' }); }
+
+        const [adminRows] = await connection.query('SELECT rol FROM usuarios WHERE id = ?', [parseInt(admin_id)]);
+        if (adminRows.length === 0 || adminRows[0].rol !== 'admin') {
+            connection.release();
+            return res.status(403).json({ error: 'Solo un administrador puede aprobar pagos.' });
+        }
+
+        const [pagoRows] = await connection.query(`
+            SELECT p.*, u.nombre AS nombre_cliente, u.email AS email_cliente, s.nombre AS nombre_servicio
             FROM pagos p
-            LEFT JOIN usuarios u ON p.id_usuario = u.id
-            LEFT JOIN citas c ON p.id_cita = c.id
-            LEFT JOIN servicios s ON c.id_servicio = s.id
+            LEFT JOIN usuarios  u ON p.id_usuario   = u.id
+            LEFT JOIN citas     c ON p.id_cita       = c.id
+            LEFT JOIN servicios s ON c.id_servicio   = s.id
             WHERE p.id = ?
         `, [id]);
-        if (pagoRows.length === 0) {
-            return res.status(404).json({ error: 'Pago no encontrado.' });
-        }
+        if (pagoRows.length === 0) { connection.release(); return res.status(404).json({ error: 'Pago no encontrado.' }); }
         const pago = pagoRows[0];
-        if (pago.estado === 'aprobado') {
-            return res.status(400).json({ error: 'Este pago ya fue aprobado anteriormente.' });
+
+        if (pago.estado === 'completado') { connection.release(); return res.status(400).json({ error: 'Este pago ya fue aprobado.' }); }
+        if (pago.estado === 'rechazado') { connection.release(); return res.status(400).json({ error: 'No se puede aprobar un pago rechazado. El cliente debe re-enviar comprobante.' }); }
+        if (pago.estado === 'reembolsado') { connection.release(); return res.status(400).json({ error: 'No se puede aprobar un pago reembolsado.' }); }
+
+        const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        await connection.beginTransaction();
+        await connection.query(
+            "UPDATE pagos SET estado='completado', admin_id=?, admin_note=?, reviewed_at=?, paid_at=? WHERE id=?",
+            [parseInt(admin_id), admin_note || null, now, now, id]
+        );
+        // Verificar si la suma de pagos completados cubre el total de la cita
+        const [pagosCita] = await connection.query(
+            "SELECT monto, estado FROM pagos WHERE id_cita = ?",
+            [pago.id_cita]
+        );
+        const pagosCompletados = pagosCita.filter(p => p.estado === 'completado');
+        const sumaPagos = pagosCompletados.reduce((s, p) => s + parseFloat(p.monto), 0);
+        const [serviciosRows] = await connection.query(
+            'SELECT precio FROM cita_servicios WHERE id_cita = ?', [pago.id_cita]
+        );
+        const totalCita = serviciosRows.reduce((s, r) => s + parseFloat(r.precio), 0);
+        if (sumaPagos >= totalCita) {
+            await connection.query("UPDATE citas SET estado='confirmada' WHERE id=?", [pago.id_cita]);
         }
-        if (pago.estado === 'rechazado') {
-            return res.status(400).json({ error: 'No se puede aprobar un pago que fue rechazado.' });
+        await connection.commit();
+        connection.release();
+
+        // Registrar historial (mejora #2)
+        await registrarHistorial(id, pago.estado, 'completado', parseInt(admin_id), admin_note || 'Aprobado por admin');
+        // Notificar al cliente (mejora #5)
+        if (pago.id_usuario) {
+            await crearNotificacion(
+                pago.id_usuario, 'pago_aprobado',
+                '✅ Pago aprobado',
+                `Tu pago de $${parseFloat(pago.monto).toLocaleString('es-CO')} para el servicio "${pago.nombre_servicio}" fue aprobado. Tu cita está confirmada.`,
+                id
+            );
         }
-        await pool.promise().query("UPDATE pagos SET estado = 'aprobado' WHERE id = ?", [id]);
-        await pool.promise().query("UPDATE citas SET estado = 'completada' WHERE id = ?", [pago.id_cita]);
+
         res.json({
-            mensaje: 'Pago aprobado correctamente. Cita marcada como completada.',
-            nombre_cliente: pago.nombre_cliente,
-            nombre_servicio: pago.nombre_servicio,
-            monto: pago.monto,
-            metodo: pago.metodo
+            mensaje: 'Pago aprobado. Cita marcada como completada.',
+            id_pago: id, estado: 'completado',
+            nombre_cliente: pago.nombre_cliente, email_cliente: pago.email_cliente,
+            nombre_servicio: pago.nombre_servicio, total: pago.monto,
+            metodo: pago.metodo, paid_at: now
         });
     } catch (error) {
+        await connection.rollback(); connection.release();
         console.error(error);
         res.status(500).json({ error: 'Error al aprobar pago.' });
     }
 });
 
-// ── ADMIN: Rechazar pago (PUT /pagos/:id/rechazar) ──
-// El motivo se almacena en el campo 'referencia' del pago
+// ── PUT /pagos/:id/rechazar ── Admin rechaza comprobante ─────────────────────────
+// Body JSON: { admin_id, admin_note }   ← admin_note es OBLIGATORIO (motivo visible al cliente)
 app.put('/pagos/:id/rechazar', async (req, res) => {
     try {
-        const { id } = req.params;
-        const { motivo } = req.body;
-        if (!motivo || motivo.trim() === '') {
-            return res.status(400).json({ error: 'Debes indicar el motivo del rechazo para notificar al cliente.' });
-        }
+        const id = parseInt(req.params.id);
+        const { admin_id, admin_note } = req.body;
+        if (isNaN(id)) return res.status(400).json({ error: 'ID de pago inválido.' });
+        if (!admin_id) return res.status(400).json({ error: 'Se requiere admin_id.' });
+        if (!admin_note || !admin_note.trim())
+            return res.status(400).json({ error: 'Se requiere admin_note con el motivo del rechazo.' });
+
+        const [adminRows] = await pool.promise().query('SELECT rol FROM usuarios WHERE id = ?', [parseInt(admin_id)]);
+        if (adminRows.length === 0 || adminRows[0].rol !== 'admin')
+            return res.status(403).json({ error: 'Solo un administrador puede rechazar pagos.' });
+
         const [pagoRows] = await pool.promise().query('SELECT * FROM pagos WHERE id = ?', [id]);
-        if (pagoRows.length === 0) {
-            return res.status(404).json({ error: 'Pago no encontrado.' });
-        }
-        if (pagoRows[0].estado === 'rechazado') {
-            return res.status(400).json({ error: 'El pago ya fue rechazado anteriormente.' });
-        }
-        if (pagoRows[0].estado === 'aprobado') {
-            return res.status(400).json({ error: 'No se puede rechazar un pago que ya fue aprobado.' });
-        }
-        // Guardar motivo en campo referencia prefijado
-        const motivoGuardado = `RECHAZO: ${motivo.trim()}`;
+        if (pagoRows.length === 0) return res.status(404).json({ error: 'Pago no encontrado.' });
+        const pago = pagoRows[0];
+
+        if (pago.estado === 'rechazado') return res.status(400).json({ error: 'Este pago ya fue rechazado.' });
+        if (pago.estado === 'completado') return res.status(400).json({ error: 'No se puede rechazar un pago ya completado.' });
+        if (pago.estado === 'reembolsado') return res.status(400).json({ error: 'No se puede rechazar un pago reembolsado.' });
+
+        const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
         await pool.promise().query(
-            "UPDATE pagos SET estado = 'rechazado', referencia = ? WHERE id = ?",
-            [motivoGuardado, id]
+            "UPDATE pagos SET estado='rechazado', admin_id=?, admin_note=?, reviewed_at=? WHERE id=?",
+            [parseInt(admin_id), admin_note.trim(), now, id]
         );
+        // Eliminar archivo para liberar espacio (el cliente deberá subir uno nuevo)
+        eliminarArchivo(pago.comprobante);
+        // Registrar historial (mejora #2)
+        await registrarHistorial(id, pago.estado, 'rechazado', parseInt(admin_id), admin_note.trim());
+        // Notificar al cliente (mejora #5)
+        if (pago.id_usuario) {
+            await crearNotificacion(
+                pago.id_usuario, 'pago_rechazado',
+                '❌ Comprobante rechazado',
+                `Tu comprobante fue rechazado. Motivo: ${admin_note.trim()}. Por favor envía un nuevo comprobante.`,
+                id
+            );
+        }
         res.json({
-            mensaje: 'Pago rechazado. El cliente deberá enviar un nuevo comprobante.',
-            motivo: motivo.trim()
+            mensaje: 'Pago rechazado. El cliente deberá re-enviar comprobante.',
+            id_pago: id, estado: 'rechazado', admin_note: admin_note.trim()
         });
     } catch (error) {
         console.error(error);
@@ -1017,114 +1362,220 @@ app.put('/pagos/:id/rechazar', async (req, res) => {
     }
 });
 
-// ── ADMIN: Registrar pago en efectivo (POST /admin/pagos) ──
-// El admin registra manualmente cuando el cliente paga en efectivo en la barbería.
-// El pago se aprueba directamente (no requiere comprobante).
-// Acepta: id_cita, id_usuario (del admin), notas (opcional), monto_personalizado (opcional para descuentos/extras)
-app.post('/admin/pagos', async (req, res) => {
+// ── PATCH /pagos/:id/solicitar-info ── Admin pide más información ────────────────
+// No cambia el estado — agrega una nota que el cliente puede ver en GET /mis-pagos
+// Body JSON: { admin_id, admin_note }
+app.patch('/pagos/:id/solicitar-info', async (req, res) => {
     try {
-        const { id_cita, id_usuario, notas, monto_personalizado } = req.body;
-        if (!id_cita || !id_usuario) {
-            return res.status(400).json({ error: 'Faltan datos obligatorios: id_cita, id_usuario.' });
-        }
+        const id = parseInt(req.params.id);
+        const { admin_id, admin_note } = req.body;
+        if (isNaN(id)) return res.status(400).json({ error: 'ID de pago inválido.' });
+        if (!admin_id) return res.status(400).json({ error: 'Se requiere admin_id.' });
+        if (!admin_note || !admin_note.trim())
+            return res.status(400).json({ error: 'Se requiere admin_note con la información solicitada.' });
 
-        // Verificar que quien registra es admin
-        const [adminCheck] = await pool.promise().query(
-            'SELECT rol FROM usuarios WHERE id = ?', [id_usuario]
+        const [adminRows] = await pool.promise().query('SELECT rol FROM usuarios WHERE id = ?', [parseInt(admin_id)]);
+        if (adminRows.length === 0 || adminRows[0].rol !== 'admin')
+            return res.status(403).json({ error: 'Solo un administrador puede solicitar información.' });
+
+        const [pagoRows] = await pool.promise().query('SELECT id, estado FROM pagos WHERE id = ?', [id]);
+        if (pagoRows.length === 0) return res.status(404).json({ error: 'Pago no encontrado.' });
+        if (pagoRows[0].estado !== 'pendiente_aprobacion')
+            return res.status(400).json({ error: 'Solo se puede pedir información en pagos pendientes de aprobación.' });
+
+        await pool.promise().query(
+            'UPDATE pagos SET admin_id = ?, admin_note = ? WHERE id = ?',
+            [parseInt(admin_id), admin_note.trim(), id]
         );
-        if (adminCheck.length === 0 || adminCheck[0].rol !== 'admin') {
-            return res.status(403).json({ error: 'Solo un administrador puede registrar pagos en efectivo.' });
-        }
-
-        // Obtener la cita con info completa del servicio y del cliente
-        const [citaRows] = await pool.promise().query(`
-            SELECT c.id, c.estado, c.id_usuario AS cliente_id,
-                   s.precio, s.nombre AS nombre_servicio,
-                   u.nombre AS nombre_cliente, u.email AS email_cliente, u.telefono AS telefono_cliente
-            FROM citas c
-            INNER JOIN servicios s ON c.id_servicio = s.id
-            INNER JOIN usuarios u ON c.id_usuario = u.id
-            WHERE c.id = ?
-        `, [id_cita]);
-
-        if (citaRows.length === 0) {
-            return res.status(404).json({ error: 'Cita no encontrada.' });
-        }
-
-        const cita = citaRows[0];
-
-        if (cita.estado === 'cancelada') {
-            return res.status(400).json({ error: 'No se puede registrar pago para una cita cancelada.' });
-        }
-        if (cita.estado === 'completada') {
-            return res.status(400).json({ error: 'Esta cita ya fue completada y no requiere registro adicional de pago.' });
-        }
-
-        // Verificar que no existe ya un pago aprobado
-        const [pagoExistente] = await pool.promise().query(
-            "SELECT id FROM pagos WHERE id_cita = ? AND estado = 'aprobado'",
-            [id_cita]
-        );
-        if (pagoExistente.length > 0) {
-            return res.status(409).json({ error: 'Esta cita ya tiene un pago aprobado registrado.' });
-        }
-
-        // Si hay un pago pendiente (comprobante enviado por el cliente), cancelarlo
-        // porque ahora pagó en efectivo presencialmente
-        const [pagoPendiente] = await pool.promise().query(
-            "SELECT id FROM pagos WHERE id_cita = ? AND estado = 'pendiente'",
-            [id_cita]
-        );
-        if (pagoPendiente.length > 0) {
-            await pool.promise().query(
-                "UPDATE pagos SET estado = 'rechazado', referencia = 'RECHAZO: Reemplazado por pago en efectivo presencial.' WHERE id = ?",
-                [pagoPendiente[0].id]
-            );
-        }
-
-        // Validar monto personalizado si se proporciona
-        let monto = cita.precio;
-        if (monto_personalizado !== undefined && monto_personalizado !== null && monto_personalizado !== '') {
-            const montoNum = parseFloat(monto_personalizado);
-            if (isNaN(montoNum) || montoNum <= 0) {
-                return res.status(400).json({ error: 'El monto personalizado debe ser un número positivo.' });
-            }
-            monto = montoNum;
-        }
-
-        const fecha = new Date().toISOString().slice(0, 19).replace('T', ' ');
-
-        const [result] = await pool.promise().query(
-            "INSERT INTO pagos (id_cita, id_usuario, monto, metodo, estado, referencia, fecha) VALUES (?, ?, ?, 'efectivo', 'aprobado', ?, ?)",
-            [id_cita, cita.cliente_id, monto, notas || null, fecha]
-        );
-
-        // Marcar la cita como completada
-        await pool.promise().query("UPDATE citas SET estado = 'completada' WHERE id = ?", [id_cita]);
-
-        res.status(201).json({
-            mensaje: `Cobro en efectivo registrado correctamente.`,
-            id_pago: result.insertId,
-            monto,
-            precio_servicio: cita.precio,
-            nombre_cliente: cita.nombre_cliente,
-            email_cliente: cita.email_cliente,
-            nombre_servicio: cita.nombre_servicio,
-            notas: notas || null,
-            fecha
+        res.json({
+            mensaje: 'Nota enviada. El pago continúa en revisión.',
+            id_pago: id, admin_note: admin_note.trim()
         });
     } catch (error) {
         console.error(error);
-        res.status(500).json({ error: 'Error al registrar pago en efectivo.' });
+        res.status(500).json({ error: 'Error al solicitar información.' });
     }
 });
 
-// ── ADMIN: Reporte de ingresos (GET /reportes/ingresos) ──
-// Filtra por fecha_desde y fecha_hasta (query params opcionales)
+// ── PUT /pagos/:id/reembolsar ── Admin registra devolución ───────────────────────
+// Body JSON: { admin_id, admin_note }
+app.put('/pagos/:id/reembolsar', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        const { admin_id, admin_note } = req.body;
+        if (isNaN(id)) return res.status(400).json({ error: 'ID de pago inválido.' });
+        if (!admin_id) return res.status(400).json({ error: 'Se requiere admin_id.' });
+        if (!admin_note || !admin_note.trim())
+            return res.status(400).json({ error: 'Se requiere admin_note con el motivo del reembolso.' });
+
+        const [adminRows] = await pool.promise().query('SELECT rol FROM usuarios WHERE id = ?', [parseInt(admin_id)]);
+        if (adminRows.length === 0 || adminRows[0].rol !== 'admin')
+            return res.status(403).json({ error: 'Solo un administrador puede registrar reembolsos.' });
+
+        const [pagoRows] = await pool.promise().query(`
+            SELECT p.*, s.nombre AS nombre_servicio, u.nombre AS nombre_cliente
+            FROM pagos p
+            LEFT JOIN citas     c ON p.id_cita    = c.id
+            LEFT JOIN servicios s ON c.id_servicio = s.id
+            LEFT JOIN usuarios  u ON p.id_usuario  = u.id
+            WHERE p.id = ?
+        `, [id]);
+        if (pagoRows.length === 0) return res.status(404).json({ error: 'Pago no encontrado.' });
+        const pago = pagoRows[0];
+
+        if (pago.estado !== 'completado')
+            return res.status(400).json({ error: 'Solo se puede reembolsar un pago completado.' });
+
+        const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        await pool.promise().query(
+            "UPDATE pagos SET estado='reembolsado', admin_id=?, admin_note=?, reviewed_at=? WHERE id=?",
+            [parseInt(admin_id), admin_note.trim(), now, id]
+        );
+        // Registrar historial (mejora #2)
+        await registrarHistorial(id, pago.estado, 'reembolsado', parseInt(admin_id), admin_note.trim());
+
+        // Mejora #9: si todos los pagos completados de la cita están reembolsados, cancelar la cita
+        const [pagosCita] = await pool.promise().query(
+            "SELECT estado FROM pagos WHERE id_cita = ?", [pago.id_cita]
+        );
+        const hayPagosActivos = pagosCita.some(p =>
+            p.estado === 'completado' || p.estado === 'pendiente' || p.estado === 'pendiente_aprobacion'
+        );
+        if (!hayPagosActivos) {
+            await pool.promise().query(
+                "UPDATE citas SET estado='cancelada' WHERE id=? AND estado != 'completada'",
+                [pago.id_cita]
+            );
+        }
+        // Notificar al cliente (mejora #5)
+        if (pago.id_usuario) {
+            await crearNotificacion(
+                pago.id_usuario, 'pago_reembolsado',
+                '💰 Reembolso registrado',
+                `Se registró el reembolso de $${parseFloat(pago.monto).toLocaleString('es-CO')} para "${pago.nombre_servicio}". Motivo: ${admin_note.trim()}.`,
+                id
+            );
+        }
+        res.json({
+            mensaje: 'Reembolso registrado correctamente.',
+            id_pago: id, estado: 'reembolsado',
+            total: pago.monto, nombre_cliente: pago.nombre_cliente,
+            nombre_servicio: pago.nombre_servicio, admin_note: admin_note.trim()
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al registrar reembolso.' });
+    }
+});
+
+// ── POST /admin/pagos ── Admin registra cobro en efectivo presencial ─────────────
+// Body JSON: { id_cita, id_admin, admin_note?, tip_amount?, discount_amount?, monto_recibido? }
+app.post('/admin/pagos', async (req, res) => {
+    try {
+        const { id_cita, id_admin, id_usuario, admin_note, tip_amount, discount_amount, monto_recibido } = req.body;
+        const adminId = parseInt(id_admin || id_usuario);
+        if (!id_cita || !adminId)
+            return res.status(400).json({ error: 'Faltan datos: id_cita, id_admin.' });
+
+        const [adminCheck] = await pool.promise().query('SELECT rol FROM usuarios WHERE id = ?', [adminId]);
+        if (adminCheck.length === 0 || adminCheck[0].rol !== 'admin')
+            return res.status(403).json({ error: 'Solo un administrador puede registrar pagos en efectivo.' });
+
+        const [citaRows] = await pool.promise().query(`
+            SELECT c.id, c.estado, c.id_usuario AS cliente_id,
+                   s.precio, s.nombre AS nombre_servicio,
+                   u.nombre AS nombre_cliente, u.email AS email_cliente
+            FROM citas c
+            INNER JOIN servicios s ON c.id_servicio = s.id
+            INNER JOIN usuarios  u ON c.id_usuario  = u.id
+            WHERE c.id = ?
+        `, [id_cita]);
+        if (citaRows.length === 0) return res.status(404).json({ error: 'Cita no encontrada.' });
+
+        const cita = citaRows[0];
+        if (cita.estado === 'cancelada') return res.status(400).json({ error: 'No se puede cobrar una cita cancelada.' });
+        if (cita.estado === 'completada') return res.status(400).json({ error: 'Esta cita ya fue completada.' });
+
+        const [pagoExistente] = await pool.promise().query(
+            "SELECT id FROM pagos WHERE id_cita = ? AND estado = 'completado'", [id_cita]
+        );
+        if (pagoExistente.length > 0) return res.status(409).json({ error: 'Esta cita ya tiene un pago completado.' });
+
+        // Cancelar comprobante en revisión si existe (pagó en efectivo presencialmente)
+        const [pagoPendiente] = await pool.promise().query(
+            "SELECT id, comprobante FROM pagos WHERE id_cita = ? AND estado IN ('pendiente', 'pendiente_aprobacion')", [id_cita]
+        );
+        for (const p of pagoPendiente) {
+            eliminarArchivo(p.comprobante);
+            await pool.promise().query('DELETE FROM pagos WHERE id = ?', [p.id]);
+        }
+
+        // Mejora #3: calcular totales y validar monto_recibido
+        const [serviciosCita] = await pool.promise().query(
+            'SELECT precio FROM cita_servicios WHERE id_cita = ?', [id_cita]
+        );
+        const subtotal = serviciosCita.length > 0
+            ? serviciosCita.reduce((s, r) => s + parseFloat(r.precio), 0)
+            : parseFloat(cita.precio);
+        const descuento = parseFloat(discount_amount) || 0;
+        const propina = parseFloat(tip_amount) || 0;
+        const total = subtotal - descuento + propina;
+
+        // Validar monto_recibido (mejora #3)
+        let montoRecibido = monto_recibido ? parseFloat(monto_recibido) : null;
+        let cambio = null;
+        if (montoRecibido !== null) {
+            if (isNaN(montoRecibido) || montoRecibido < 0)
+                return res.status(400).json({ error: 'monto_recibido debe ser un número positivo.' });
+            if (montoRecibido < total)
+                return res.status(400).json({
+                    error: `El monto recibido ($${montoRecibido.toLocaleString('es-CO')}) es menor al total ($${total.toLocaleString('es-CO')}).`
+                });
+            cambio = parseFloat((montoRecibido - total).toFixed(2));
+        }
+
+        const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+        const [result] = await pool.promise().query(
+            `INSERT INTO pagos
+               (id_cita, id_usuario, subtotal, discount_amount, tip_amount, monto,
+                monto_recibido, cambio, metodo, estado, admin_id, admin_note, reviewed_at, paid_at, fecha)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'efectivo', 'completado', ?, ?, ?, ?, ?)`,
+            [id_cita, cita.cliente_id, subtotal, descuento, propina, total,
+                montoRecibido, cambio, adminId, admin_note || null, now, now, now]
+        );
+        await pool.promise().query("UPDATE citas SET estado='confirmada' WHERE id=?", [id_cita]);
+
+        // Registrar historial (mejora #2)
+        await registrarHistorial(result.insertId, null, 'completado', adminId, 'Cobro en efectivo presencial');
+
+        // Notificar al cliente (mejora #5)
+        await crearNotificacion(
+            cita.cliente_id, 'pago_completado',
+            '✅ Pago registrado',
+            `Tu pago de $${total.toLocaleString('es-CO')} en efectivo por "${cita.nombre_servicio}" fue registrado. ¡Tu cita está confirmada!`,
+            result.insertId
+        );
+
+        res.status(201).json({
+            mensaje: 'Cobro en efectivo registrado correctamente.',
+            id_pago: result.insertId, estado: 'completado',
+            subtotal, discount_amount: descuento, tip_amount: propina, total,
+            monto_recibido: montoRecibido, cambio,
+            nombre_cliente: cita.nombre_cliente, email_cliente: cita.email_cliente,
+            nombre_servicio: cita.nombre_servicio, paid_at: now
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al registrar cobro en efectivo.' });
+    }
+});
+
+// ── GET /reportes/ingresos ── Admin: reporte financiero ──────────────────────────
 app.get('/reportes/ingresos', async (req, res) => {
     try {
         const { fecha_desde, fecha_hasta } = req.query;
-        let whereClause = "WHERE p.estado = 'aprobado'";
+        let whereClause = "WHERE p.estado = 'completado'";
         const params = [];
         if (fecha_desde) { whereClause += ' AND DATE(p.fecha) >= ?'; params.push(fecha_desde); }
         if (fecha_hasta) { whereClause += ' AND DATE(p.fecha) <= ?'; params.push(fecha_hasta); }
@@ -1149,7 +1600,7 @@ app.get('/reportes/ingresos', async (req, res) => {
         const [topServicios] = await pool.promise().query(
             `SELECT s.nombre AS servicio, COUNT(*) AS total, SUM(p.monto) AS monto
              FROM pagos p
-             INNER JOIN citas c ON p.id_cita = c.id
+             INNER JOIN citas    c ON p.id_cita    = c.id
              INNER JOIN servicios s ON c.id_servicio = s.id
              ${whereClause} GROUP BY s.id ORDER BY monto DESC LIMIT 5`, params
         );
@@ -1157,28 +1608,6 @@ app.get('/reportes/ingresos', async (req, res) => {
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Error al generar reporte de ingresos.' });
-    }
-});
-
-// Ver pagos de una cita (GET /pagos/cita/:id_cita)
-app.get('/pagos/cita/:id_cita', async (req, res) => {
-    try {
-        const { id_cita } = req.params;
-        const [rows] = await pool.promise().query(`
-            SELECT p.id, p.id_cita, p.id_usuario, p.monto, p.metodo, p.estado,
-                   DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
-                   p.comprobante, p.referencia
-            FROM pagos p WHERE p.id_cita = ?
-        `, [id_cita]);
-        const base = `${req.protocol}://${req.get('host')}`;
-        const pagosConUrl = rows.map(r => ({
-            ...r,
-            comprobante_url: r.comprobante ? `${base}${r.comprobante}` : null
-        }));
-        res.status(200).json({ pagos: pagosConUrl });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Error al consultar pagos de la cita.' });
     }
 });
 
@@ -1323,45 +1752,45 @@ app.post('/dashboard/citas-por-mes', verificarRol('admin'), async (req, res) => 
 // Endpoint consolidado para estadísticas de pagos - Solo Admin
 app.post('/dashboard/pagos-stats', verificarRol('admin'), async (req, res) => {
     try {
-        // Total de pagos aprobados
+        // Total de pagos completados
         const [totalPagosRows] = await pool.promise().query(
-            "SELECT COUNT(*) as total FROM pagos WHERE estado = 'aprobado'"
+            "SELECT COUNT(*) as total FROM pagos WHERE estado = 'completado'"
         );
         const totalPagos = totalPagosRows[0]?.total || 0;
 
-        // Total monto pagado (pagos aprobados)
+        // Total monto pagado (pagos completados)
         const [totalMontoRows] = await pool.promise().query(
-            "SELECT SUM(monto) as totalMonto FROM pagos WHERE estado = 'aprobado'"
+            "SELECT SUM(monto) as totalMonto FROM pagos WHERE estado = 'completado'"
         );
         const totalMontoPagado = totalMontoRows[0]?.totalMonto || 0;
 
         // Pagos pendientes de aprobación
         const [[{ totalPendientes }]] = await pool.promise().query(
-            "SELECT COUNT(*) as totalPendientes FROM pagos WHERE estado = 'pendiente'"
+            "SELECT COUNT(*) as totalPendientes FROM pagos WHERE estado = 'pendiente_aprobacion'"
         );
 
-        // Pagos por método (solo aprobados)
+        // Pagos por método (solo completados)
         const [pagosPorMetodoRows] = await pool.promise().query(
-            "SELECT metodo, COUNT(*) as total, SUM(monto) as montoTotal FROM pagos WHERE estado = 'aprobado' GROUP BY metodo"
+            "SELECT metodo, COUNT(*) as total, SUM(monto) as montoTotal FROM pagos WHERE estado = 'completado' GROUP BY metodo"
         );
         const pagosPorMetodo = pagosPorMetodoRows || [];
 
-        // Pagos por mes (solo aprobados)
+        // Pagos por mes (solo completados)
         const [pagosPorMesRows] = await pool.promise().query(`
             SELECT DATE_FORMAT(pagos.fecha, '%Y-%m') as mes, COUNT(*) as total, SUM(pagos.monto) as montoTotal
             FROM pagos
-            WHERE pagos.estado = 'aprobado'
+            WHERE pagos.estado = 'completado'
             GROUP BY DATE_FORMAT(pagos.fecha, '%Y-%m')
             ORDER BY mes DESC
             LIMIT 12
         `);
         const pagosPorMes = pagosPorMesRows || [];
 
-        // Pagos por día (solo aprobados)
+        // Pagos por día (solo completados)
         const [pagosPorDiaRows] = await pool.promise().query(`
             SELECT DATE(pagos.fecha) as dia, COUNT(*) as total, SUM(pagos.monto) as montoTotal
             FROM pagos
-            WHERE pagos.estado = 'aprobado'
+            WHERE pagos.estado = 'completado'
             GROUP BY DATE(pagos.fecha)
             ORDER BY dia DESC
             LIMIT 30
@@ -1389,67 +1818,437 @@ app.post('/dashboard/pagos-stats', verificarRol('admin'), async (req, res) => {
     }
 });
 
-app.listen(port, () => {
-    console.log(`Servidor de Barbería escuchando en http://localhost:${port}`);
-    console.log('RUTAS DISPONIBLES 🚌:');
-    console.log('POST   /register   -> Registrar usuario');
-    console.log('POST   /login      -> Iniciar sesión');
+// ── GET /comprobante/:id_pago ── Genera PDF del comprobante de pago ─────────────
+app.get('/comprobante/:id_pago', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id_pago);
+        if (isNaN(id)) return res.status(400).json({ error: 'ID de pago inválido.' });
 
-    // Listar usuarios
-    console.log('USUARIOS⚙️');
-    console.log('GET    /usuarios   -> Listar usuarios');
-    console.log('PUT    /usuarios/:id   -> Actualizar usuario');
-    console.log('DELETE /usuarios/:id   -> Eliminar usuario');
-    console.log('GET    /usuarios/:id   -> Ver usuario por id');
+        const [pagos] = await pool.promise().query(`
+            SELECT p.*,
+                   u.nombre AS nombre_cliente, u.email, u.telefono,
+                   DATE_FORMAT(c.fecha_hora, '%d/%m/%Y %H:%i') AS fecha_cita,
+                   c.notas AS notas_cita,
+                   b.nombre AS nombre_barbero
+            FROM pagos p
+            LEFT JOIN usuarios  u ON p.id_usuario = u.id
+            LEFT JOIN citas     c ON p.id_cita    = c.id
+            LEFT JOIN usuarios  b ON c.id_barbero = b.id
+            WHERE p.id = ?
+        `, [id]);
+        if (pagos.length === 0) return res.status(404).json({ error: 'Pago no encontrado.' });
+        const pago = pagos[0];
 
-    // Listar servicios
-    console.log('SERVICIOS⚙️');
-    console.log('GET    /servicios   -> Listar servicios');
-    console.log('POST   /servicios   -> Crear servicio');
-    console.log('PUT    /servicios/:id   -> Actualizar servicio');
-    console.log('DELETE /servicios/:id   -> Eliminar servicio');
-    console.log('GET    /servicios/:id   -> Ver servicio por id');
+        // Servicios de la cita
+        let [servicios] = await pool.promise().query(
+            'SELECT nombre, precio FROM cita_servicios WHERE id_cita = ?', [pago.id_cita]
+        );
+        if (servicios.length === 0) {
+            const [srvFallback] = await pool.promise().query(
+                'SELECT s.nombre, s.precio FROM citas c INNER JOIN servicios s ON c.id_servicio = s.id WHERE c.id = ?',
+                [pago.id_cita]
+            );
+            servicios = srvFallback;
+        }
 
-    // Listar citas
-    console.log('CITAS📅');
-    console.log('GET    /citas   -> Listar citas');
-    console.log('POST   /citas   -> Crear cita (valida disponibilidad)');
-    console.log('PUT    /citas/:id   -> Actualizar cita completa (valida disponibilidad)');
-    console.log('PATCH  /citas/:id/estado   -> Actualizar solo el estado de la cita');
-    console.log('DELETE /citas/:id   -> Eliminar cita');
-    console.log('GET    /citas/:id   -> Ver cita por id');
-    console.log('GET    /citas/disponibilidad/:fecha_hora   -> Verificar disponibilidad');
+        const doc = new PDFDocument({ margin: 50, size: 'A5' });
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `inline; filename="comprobante-${id}.pdf"`);
+        doc.pipe(res);
 
-    // Dashboard Admin
-    console.log('DASHBOARD ADMIN 📊 (Solo rol: admin)');
-    console.log('POST   /dashboard/stats   -> Todas las estadísticas (recomendado)');
-    console.log('POST   /dashboard/total-usuarios   -> Total de usuarios');
-    console.log('POST   /dashboard/total-citas   -> Total de citas');
-    console.log('POST   /dashboard/total-servicios   -> Total de servicios');
-    console.log('POST   /dashboard/citas-por-estado   -> Citas por estado');
-    console.log('POST   /dashboard/citas-por-dia   -> Citas por día');
-    console.log('POST   /dashboard/citas-por-mes   -> Citas por mes');
-    console.log('POST   /dashboard/pagos-stats   -> Estadísticas de pagos');
+        // ── Encabezado ──
+        doc.fontSize(18).font('Helvetica-Bold').text('✂  BARBERÍA', { align: 'center' });
+        doc.fontSize(10).font('Helvetica').text('Comprobante de Pago', { align: 'center' });
+        doc.moveDown(0.5);
+        doc.moveTo(50, doc.y).lineTo(395, doc.y).lineWidth(1).stroke(); doc.moveDown(0.5);
 
+        // ── Número y fecha ──
+        const emision = new Date().toLocaleDateString('es-CO', { dateStyle: 'long' });
+        doc.fontSize(9);
+        doc.text(`N° REC-${String(id).padStart(6, '0')}   |   Emisión: ${emision}`);
+        doc.text(`Fecha de cita: ${pago.fecha_cita || '—'}`);
+        if (pago.nombre_barbero) doc.text(`Barbero: ${pago.nombre_barbero}`);
+        doc.moveDown();
 
+        // ── Cliente ──
+        doc.fontSize(10).font('Helvetica-Bold').text('Cliente');
+        doc.fontSize(9).font('Helvetica');
+        doc.text(pago.nombre_cliente || '—');
+        if (pago.email) doc.text(pago.email);
+        if (pago.telefono) doc.text(pago.telefono);
+        doc.moveDown();
 
-    // ==================== PAGOS ====================
-    console.log('PAGOS 💸');
-    console.log('── CLIENTE ──');
-    console.log('POST   /pagos                  -> Registrar pago con comprobante (multipart/form-data: transferencia/tarjeta)');
-    console.log('GET    /mis-pagos?id_usuario=X -> Ver mis pagos');
-    console.log('── ADMIN ──');
-    console.log('GET    /pagos                  -> Listar todos los pagos (filtros: estado, metodo, id_usuario, fecha_desde, fecha_hasta)');
-    console.log('GET    /pagos/pendientes        -> Pagos pendientes de revisión (con comprobante)');
-    console.log('GET    /pagos/:id              -> Ver pago por id');
-    console.log('GET    /pagos/cita/:id_cita    -> Ver pagos de una cita');
-    console.log('PUT    /pagos/:id/aprobar      -> Aprobar comprobante (marca cita como completada)');
-    console.log('PUT    /pagos/:id/rechazar     -> Rechazar comprobante (requiere motivo)');
-    console.log('POST   /admin/pagos            -> Registrar cobro en efectivo (aprobado directo)');
-    console.log('GET    /reportes/ingresos      -> Reporte de ingresos (filtros: fecha_desde, fecha_hasta)');
-    console.log('📁 Comprobantes disponibles en: /uploads/comprobantes/:archivo');
+        // ── Tabla de servicios ──
+        doc.fontSize(10).font('Helvetica-Bold').text('Servicios');
+        doc.moveDown(0.2);
+        doc.moveTo(50, doc.y).lineTo(395, doc.y).stroke(); doc.moveDown(0.2);
+        doc.fontSize(9).font('Helvetica');
+        for (const s of servicios) {
+            const y = doc.y;
+            doc.text(s.nombre, 50, y, { width: 260 });
+            doc.text(`$${parseFloat(s.precio).toLocaleString('es-CO')}`, 310, y, { width: 85, align: 'right' });
+            doc.moveDown(0.3);
+        }
+        doc.moveTo(50, doc.y).lineTo(395, doc.y).stroke(); doc.moveDown(0.3);
+
+        // ── Totales ──
+        const subtotal = parseFloat(pago.subtotal || pago.monto || 0);
+        const descuento = parseFloat(pago.discount_amount || 0);
+        const propina = parseFloat(pago.tip_amount || 0);
+        const total = parseFloat(pago.monto || 0);
+        const recibido = parseFloat(pago.monto_recibido || 0);
+        const cambio = parseFloat(pago.cambio || 0);
+
+        const addRow = (label, valor, bold = false) => {
+            const y = doc.y;
+            doc[bold ? 'font' : 'font']('Helvetica' + (bold ? '-Bold' : ''));
+            doc.fontSize(bold ? 10 : 9).text(label, 210, y, { width: 140 });
+            doc.text(`$${valor.toLocaleString('es-CO')}`, 310, y, { width: 85, align: 'right' });
+            doc.moveDown(0.3);
+        };
+        if (descuento > 0) { addRow('Subtotal:', subtotal); addRow('Descuento:', -descuento); }
+        if (propina > 0) addRow('Propina:', propina);
+        addRow('TOTAL:', total, true);
+        if (recibido > 0) { addRow('Recibido:', recibido); addRow('Cambio:', cambio); }
+        doc.moveDown(0.5);
+
+        // ── Método y estado ──
+        doc.moveTo(50, doc.y).lineTo(395, doc.y).stroke(); doc.moveDown(0.3);
+        const metodoLabel = { efectivo: 'Efectivo', tarjeta: 'Tarjeta', transferencia: 'Transferencia', nequi: 'Nequi', daviplata: 'Daviplata' };
+        doc.fontSize(9).font('Helvetica-Bold').text('Información de Pago');
+        doc.font('Helvetica');
+        doc.text(`Método: ${metodoLabel[pago.metodo] || pago.metodo}`);
+        doc.text(`Estado: ${(pago.estado || '').replace(/_/g, ' ').toUpperCase()}`);
+        if (pago.paid_at) doc.text(`Pagado: ${pago.paid_at}`);
+        if (pago.transaction_id) doc.text(`ID Transacción: ${pago.transaction_id}`);
+        if (pago.reference_code) doc.text(`Referencia: ${pago.reference_code}`);
+        if (pago.admin_note) doc.text(`Nota: ${pago.admin_note}`);
+        doc.moveDown(1.5);
+
+        // ── Pie ──
+        doc.fontSize(8).fillColor('#888888').text('Documento generado automáticamente. Gracias por su preferencia.', { align: 'center' });
+        doc.end();
+    } catch (error) {
+        console.error(error);
+        if (!res.headersSent) res.status(500).json({ error: 'Error al generar comprobante.' });
+    }
 });
 
+// ==================== NUEVOS ENDPOINTS (MEJORAS #2, #4, #5, #6, #7) ====================
 
+// ── GET /pagos/:id/historial ── Mejora #2: historial de estados de un pago ────────
+app.get('/pagos/:id/historial', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) return res.status(400).json({ error: 'ID de pago inválido.' });
+        const [pagoCheck] = await pool.promise().query('SELECT id FROM pagos WHERE id = ?', [id]);
+        if (pagoCheck.length === 0) return res.status(404).json({ error: 'Pago no encontrado.' });
+        const [rows] = await pool.promise().query(`
+            SELECT h.id, h.estado_anterior, h.estado_nuevo, h.nota,
+                   DATE_FORMAT(h.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+                   u.nombre AS nombre_admin
+            FROM pagos_historial h
+            LEFT JOIN usuarios u ON h.admin_id = u.id
+            WHERE h.id_pago = ?
+            ORDER BY h.fecha ASC
+        `, [id]);
+        res.json({ id_pago: id, historial: rows, total: rows.length });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar historial.' });
+    }
+});
+
+// ── GET /notificaciones?id_usuario=X&leida=false ── Mejora #5 ───────────────────
+app.get('/notificaciones', async (req, res) => {
+    try {
+        const { id_usuario, leida } = req.query;
+        if (!id_usuario) return res.status(400).json({ error: 'id_usuario requerido.' });
+        let query = `
+            SELECT id, tipo, titulo, mensaje, leida, id_ref,
+                   DATE_FORMAT(fecha, '%Y-%m-%d %H:%i:%s') AS fecha
+            FROM notificaciones WHERE id_usuario = ?
+        `;
+        const params = [parseInt(id_usuario)];
+        if (leida !== undefined) {
+            query += ' AND leida = ?';
+            params.push(leida === 'true' || leida === '1' ? 1 : 0);
+        }
+        query += ' ORDER BY fecha DESC LIMIT 50';
+        const [rows] = await pool.promise().query(query, params);
+        const [[{ no_leidas }]] = await pool.promise().query(
+            'SELECT COUNT(*) AS no_leidas FROM notificaciones WHERE id_usuario = ? AND leida = 0',
+            [parseInt(id_usuario)]
+        );
+        res.json({ notificaciones: rows, no_leidas, total: rows.length });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar notificaciones.' });
+    }
+});
+
+// ── PATCH /notificaciones/:id/leer ── Mejora #5: marcar notificación como leída ──
+app.patch('/notificaciones/:id/leer', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        if (isNaN(id)) return res.status(400).json({ error: 'ID inválido.' });
+        await pool.promise().query('UPDATE notificaciones SET leida = 1 WHERE id = ?', [id]);
+        res.json({ mensaje: 'Notificación marcada como leída.', id });
+    } catch (error) {
+        res.status(500).json({ error: 'Error al actualizar notificación.' });
+    }
+});
+
+// ── PATCH /notificaciones/leer-todas ── Mejora #5: marcar todas como leídas ──────
+app.patch('/notificaciones/leer-todas', async (req, res) => {
+    try {
+        const { id_usuario } = req.body;
+        if (!id_usuario) return res.status(400).json({ error: 'id_usuario requerido.' });
+        const [result] = await pool.promise().query(
+            'UPDATE notificaciones SET leida = 1 WHERE id_usuario = ? AND leida = 0',
+            [parseInt(id_usuario)]
+        );
+        res.json({ mensaje: 'Notificaciones marcadas como leídas.', actualizadas: result.affectedRows });
+    } catch (error) {
+        res.status(500).json({ error: 'Error al actualizar notificaciones.' });
+    }
+});
+
+// ── POST /admin/pagos/mixto ── Mejora #4: pago mixto (efectivo + digital) ─────────
+// Body JSON: { id_cita, id_admin, pagos: [{metodo, monto, referencia?, transaction_id?}], admin_note? }
+app.post('/admin/pagos/mixto', async (req, res) => {
+    const connection = await pool.promise().getConnection();
+    try {
+        const { id_cita, id_admin, pagos, admin_note } = req.body;
+        const adminId = parseInt(id_admin);
+        if (!id_cita || !adminId || !Array.isArray(pagos) || pagos.length === 0)
+            return res.status(400).json({ error: 'Requeridos: id_cita, id_admin, pagos (array).' });
+
+        const [adminCheck] = await connection.query('SELECT rol FROM usuarios WHERE id = ?', [adminId]);
+        if (adminCheck.length === 0 || adminCheck[0].rol !== 'admin') {
+            connection.release();
+            return res.status(403).json({ error: 'Solo un administrador puede registrar pagos mixtos.' });
+        }
+
+        const [citaRows] = await connection.query(`
+            SELECT c.id, c.estado, c.id_usuario AS cliente_id, u.nombre AS nombre_cliente
+            FROM citas c INNER JOIN usuarios u ON c.id_usuario = u.id
+            WHERE c.id = ?
+        `, [id_cita]);
+        if (citaRows.length === 0) { connection.release(); return res.status(404).json({ error: 'Cita no encontrada.' }); }
+        const cita = citaRows[0];
+        if (cita.estado === 'cancelada') { connection.release(); return res.status(400).json({ error: 'Cita cancelada.' }); }
+
+        // Total de la cita
+        const [srvRows] = await connection.query('SELECT precio FROM cita_servicios WHERE id_cita = ?', [id_cita]);
+        const totalCita = srvRows.reduce((s, r) => s + parseFloat(r.precio), 0);
+
+        // Suma de los pagos del body
+        const totalPagos = pagos.reduce((s, p) => s + parseFloat(p.monto || 0), 0);
+        if (parseFloat(totalPagos.toFixed(2)) < parseFloat(totalCita.toFixed(2)))
+            return res.status(400).json({
+                error: `La suma de los pagos ($${totalPagos}) es menor al total de la cita ($${totalCita}).`
+            });
+
+        const metodosValidos = ['efectivo', 'transferencia', 'tarjeta', 'nequi', 'daviplata'];
+        for (const p of pagos) {
+            if (!metodosValidos.includes(p.metodo))
+                return res.status(400).json({ error: `Método inválido: ${p.metodo}` });
+        }
+
+        await connection.beginTransaction();
+        const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        const ids_pagos = [];
+        for (const p of pagos) {
+            const [result] = await connection.query(
+                `INSERT INTO pagos (id_cita, id_usuario, subtotal, monto, metodo, estado,
+                    referencia, transaction_id, admin_id, admin_note, reviewed_at, paid_at, fecha)
+                 VALUES (?, ?, ?, ?, ?, 'completado', ?, ?, ?, ?, ?, ?, ?)`,
+                [id_cita, cita.cliente_id, parseFloat(p.monto), parseFloat(p.monto),
+                    p.metodo, p.referencia || null, p.transaction_id || null,
+                    adminId, admin_note || null, now, now, now]
+            );
+            ids_pagos.push(result.insertId);
+            await registrarHistorial(result.insertId, null, 'completado', adminId, `Pago mixto - ${p.metodo}`);
+        }
+        await connection.query("UPDATE citas SET estado='confirmada' WHERE id=?", [id_cita]);
+        await connection.commit();
+        connection.release();
+
+        // Notificar al cliente (mejora #5)
+        await crearNotificacion(
+            cita.cliente_id, 'pago_completado',
+            '✅ Pago mixto registrado',
+            `Tu pago de $${totalPagos.toLocaleString('es-CO')} fue registrado con múltiples métodos. ¡Tu cita está confirmada!`,
+            ids_pagos[0]
+        );
+
+        res.status(201).json({
+            mensaje: 'Pagos mixtos registrados correctamente.',
+            ids_pagos, total: totalPagos, cita_estado: 'confirmada'
+        });
+    } catch (error) {
+        await connection.rollback(); connection.release();
+        console.error(error);
+        res.status(500).json({ error: 'Error al registrar pagos mixtos.' });
+    }
+});
+
+// ── GET /pagos/usuario/:id_usuario/resumen ── Mejora #7: resumen financiero ──────
+app.get('/pagos/usuario/:id_usuario/resumen', async (req, res) => {
+    try {
+        const id_usuario = parseInt(req.params.id_usuario);
+        if (isNaN(id_usuario)) return res.status(400).json({ error: 'ID inválido.' });
+
+        const [[totales]] = await pool.promise().query(`
+            SELECT
+                COUNT(*)                                       AS total_pagos,
+                COALESCE(SUM(CASE WHEN estado='completado'            THEN monto  ELSE 0 END), 0) AS total_pagado,
+                COALESCE(SUM(CASE WHEN estado='pendiente_aprobacion'  THEN monto  ELSE 0 END), 0) AS total_en_revision,
+                COALESCE(SUM(CASE WHEN estado='pendiente'             THEN monto  ELSE 0 END), 0) AS total_pendiente,
+                COALESCE(SUM(CASE WHEN estado='reembolsado'           THEN monto  ELSE 0 END), 0) AS total_reembolsado,
+                COUNT(CASE WHEN estado='completado'           THEN 1 END) AS pagos_completados,
+                COUNT(CASE WHEN estado='pendiente_aprobacion' THEN 1 END) AS pagos_en_revision,
+                COUNT(CASE WHEN estado='rechazado'            THEN 1 END) AS pagos_rechazados
+            FROM pagos WHERE id_usuario = ?
+        `, [id_usuario]);
+
+        const [ultimos] = await pool.promise().query(`
+            SELECT p.id, p.monto, p.metodo, p.estado,
+                   DATE_FORMAT(p.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+                   s.nombre AS servicio
+            FROM pagos p
+            LEFT JOIN citas    c ON p.id_cita    = c.id
+            LEFT JOIN servicios s ON c.id_servicio = s.id
+            WHERE p.id_usuario = ?
+            ORDER BY p.fecha DESC LIMIT 5
+        `, [id_usuario]);
+
+        res.json({ id_usuario, resumen: totales, ultimos_pagos: ultimos });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al consultar resumen.' });
+    }
+});
+
+// ── GET /admin/comprobantes/huerfanos ── Mejora #6: listar archivos sin pago ─────
+app.get('/admin/comprobantes/huerfanos', async (req, res) => {
+    try {
+        // Obtener todos los comprobantes registrados en DB
+        const [rows] = await pool.promise().query('SELECT comprobante FROM pagos WHERE comprobante IS NOT NULL');
+        const enDB = new Set(rows.map(r => path.join(__dirname, r.comprobante)));
+
+        // Listar todos los archivos físicos
+        const huerfanos = [];
+        const walk = (dir) => {
+            if (!fs.existsSync(dir)) return;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) walk(full);
+                else if (!enDB.has(full)) huerfanos.push(full.replace(__dirname, '').replace(/\\/g, '/'));
+            }
+        };
+        walk(UPLOADS_DIR);
+        res.json({ huerfanos, total: huerfanos.length });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al buscar archivos huérfanos.' });
+    }
+});
+
+// ── DELETE /admin/comprobantes/limpiar ── Mejora #6: eliminar archivos huérfanos ─
+app.delete('/admin/comprobantes/limpiar', async (req, res) => {
+    try {
+        const [rows] = await pool.promise().query('SELECT comprobante FROM pagos WHERE comprobante IS NOT NULL');
+        const enDB = new Set(rows.map(r => path.join(__dirname, r.comprobante)));
+
+        let eliminados = 0;
+        const walk = (dir) => {
+            if (!fs.existsSync(dir)) return;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) walk(full);
+                else if (!enDB.has(full)) {
+                    try { fs.unlinkSync(full); eliminados++; } catch (_) { }
+                }
+            }
+        };
+        walk(UPLOADS_DIR);
+        res.json({ mensaje: `${eliminados} archivo(s) huérfano(s) eliminado(s).`, eliminados });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Error al limpiar archivos.' });
+    }
+});
+
+app.listen(port, () => {
+    console.log(`Servidor de Barbería escuchando en http://localhost:${port}`);
+    console.log('RUTAS DISPONIBLES 🚌');
+
+    console.log('\nAUTH');
+    console.log('  POST   /register');
+    console.log('  POST   /login');
+
+    console.log('\nCITAS 📅');
+    console.log('  POST   /citas                          → RESERVADA + pago PENDIENTE auto');
+    console.log('  GET    /citas                          → listado con servicios y barbero');
+    console.log('  GET    /citas/:id                      → detalle');
+    console.log('  PUT    /citas/:id                      → actualizar');
+    console.log('  PATCH  /citas/:id/estado               → cambiar estado');
+    console.log('  PUT    /citas/:id/completar            → servicio prestado → COMPLETADA');
+    console.log('  DELETE /citas/:id                      → eliminar');
+    console.log('  GET    /citas/disponibilidad/:fecha_hora?id_servicio&id_barbero');
+
+    console.log('\nPAGOS 💸 — flujo completo');
+    console.log('  POST   /pagos                          (comprobante) → PENDIENTE_APROBACION');
+    console.log('  GET    /mis-pagos?id_usuario=X');
+    console.log('  DELETE /pagos/:id                      (cancelar pendiente/rechazado)');
+    console.log('  GET    /pagos                          listado completo con filtros');
+    console.log('  GET    /pagos/pendientes               comprobantes en revisión');
+    console.log('  GET    /pagos/:id                      detalle de un pago');
+    console.log('  GET    /pagos/cita/:id_cita            todos los pagos de una cita');
+    console.log('  PUT    /pagos/:id/aprobar              → COMPLETADO + cita CONFIRMADA');
+    console.log('  PUT    /pagos/:id/rechazar');
+    console.log('  PATCH  /pagos/:id/solicitar-info');
+    console.log('  PUT    /pagos/:id/reembolsar');
+    console.log('  GET    /pagos/:id/historial            historial de cambios de estado');
+    console.log('  GET    /pagos/usuario/:id/resumen      resumen financiero del usuario');
+    console.log('  POST   /admin/pagos                    cobro efectivo presencial');
+    console.log('  POST   /admin/pagos/mixto              pago con multiples metodos');
+    console.log('  GET    /admin/comprobantes/huerfanos   archivos sin pago asociado');
+    console.log('  DELETE /admin/comprobantes/limpiar     eliminar archivos huerfanos');
+    console.log('  GET    /reportes/ingresos');
+    console.log('  GET    /comprobante/:id_pago           PDF comprobante de pago');
+
+    console.log('\nNOTIFICACIONES 🔔');
+    console.log('  GET    /notificaciones?id_usuario=X&leida=false');
+    console.log('  PATCH  /notificaciones/:id/leer');
+    console.log('  PATCH  /notificaciones/leer-todas');
+
+    console.log('\nDASHBOARD ADMIN 📊  (Solo rol: admin)');
+    console.log('  POST   /dashboard/stats               todas las estadisticas');
+    console.log('  POST   /dashboard/total-usuarios');
+    console.log('  POST   /dashboard/total-citas');
+    console.log('  POST   /dashboard/total-servicios');
+    console.log('  POST   /dashboard/citas-por-estado');
+    console.log('  POST   /dashboard/citas-por-dia');
+    console.log('  POST   /dashboard/citas-por-mes');
+    console.log('  POST   /dashboard/pagos-stats');
+
+    console.log('\n──────────────────────────────────────────────────');
+    console.log('  Estados cita: reservada → confirmada → completada | cancelada');
+    console.log('  Estados pago: pendiente → pendiente_aprobacion → completado | rechazado | reembolsado');
+    console.log('\n  Mejoras activas:');
+    console.log('  #1  Multiples pagos/abonos por cita');
+    console.log('  #2  Historial de cambios de estado en pagos');
+    console.log('  #3  Validacion monto_recibido y calculo de cambio en efectivo');
+    console.log('  #4  Pagos mixtos (efectivo + digital simultaneo)');
+    console.log('  #5  Notificaciones automaticas al cliente y admins');
+    console.log('  #6  Archivos organizados por anio/mes + limpieza de huerfanos');
+    console.log('  #7  API resumen financiero por usuario');
+    console.log('  #9  Cancelacion automatica de pagos al cancelar cita');
+    console.log('  #10 saldo_pendiente en GET /citas y GET /citas/:id');
+    console.log('──────────────────────────────────────────────────');
+});
 
 
